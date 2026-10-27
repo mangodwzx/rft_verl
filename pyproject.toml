@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "math-rft-verl"
+version = "0.1.0"
+description = "Controlled prompt-balanced RFT/GRPO experiments on four Qwen Base models"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+# The GPU stack is installed from the pinned upstream uv.lock; do not let pip
+# independently choose torch/vLLM/Transformers versions for this project.
+dependencies = ["math-verify==0.9.0", "latex2sympy2_extended==1.11.0"]
+
+[project.optional-dependencies]
+static = ["ruff==0.14.2", "PyYAML==6.0.3"]
+plots = ["matplotlib>=3.8,<4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+exclude = ["vendor", ".venv", ".upstream_reference", "data", "runs"]
+
+[tool.ruff.lint]
+select = ["E9", "F", "B"]
+ignore = ["B905"]

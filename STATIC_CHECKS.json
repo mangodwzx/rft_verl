@@ -1,0 +1,96 @@
+{
+  "check_type": "static_only",
+  "status": "passed",
+  "checked_at_utc": "2026-10-25T07:23:59.665676+00:00",
+  "files": [
+    {
+      "file": "src/math_rft/__init__.py",
+      "sha256": "5cf72dc4eb81d0ac167de2dfd896f462a01bf2464f562fbee5a4ae851d3db4a7"
+    },
+    {
+      "file": "src/math_rft/algorithms.py",
+      "sha256": "28283481d4bd9ae868dc49601e7a20f878a120d847a640ab927df47df6424337"
+    },
+    {
+      "file": "src/math_rft/analyze.py",
+      "sha256": "43acfbb45862f05b6fb05bd9e31fd4816725005d5aa83f351afd029c6058e104"
+    },
+    {
+      "file": "src/math_rft/compatibility.py",
+      "sha256": "a9f86e69318c0b90e588575b7a4479658521769e2199328a832344cd221bfef2"
+    },
+    {
+      "file": "src/math_rft/data.py",
+      "sha256": "877e5454024c4524f4bcdd6cf495750b2fe195fa65ca5f8d0d62c4574e58a662"
+    },
+    {
+      "file": "src/math_rft/diagnose.py",
+      "sha256": "b2d46850c74f66f5fffcfe287cb2ad10e0b6f3fc026fa67c3472f6823f9045c7"
+    },
+    {
+      "file": "src/math_rft/evaluate.py",
+      "sha256": "f8278692b8c7050d28bfacebcc7e9e45a1b69b6cc7f12ea15ebb377f0ed5892a"
+    },
+    {
+      "file": "src/math_rft/io_utils.py",
+      "sha256": "72a09ab29ada74f2f86ebe7326fd2b4f53ea29fbf760bae14d19acdf6aef8600"
+    },
+    {
+      "file": "src/math_rft/metrics.py",
+      "sha256": "c551735eefb862446c91af19cb287c00d96f77e269c792e0884b873a741674ed"
+    },
+    {
+      "file": "src/math_rft/pipeline.py",
+      "sha256": "bd07806c5be2c48c1c66867baab5de3f77663a99092a1d6dbfcaadce043a5331"
+    },
+    {
+      "file": "src/math_rft/plot.py",
+      "sha256": "7ae73395e4c63458497011c411e8d548fd0615e7d7c0e9ea7ba51c8b3f743800"
+    },
+    {
+      "file": "src/math_rft/prompts.py",
+      "sha256": "593c6407d620eacc8fd1d6160c0aa047f31f8e97d296f5a89e5a5f49f6c2031f"
+    },
+    {
+      "file": "src/math_rft/raw_loop.py",
+      "sha256": "517788e927486dbcb4d7d41d2df78f0469e231aa0de7b526ba00f815b43b4f94"
+    },
+    {
+      "file": "src/math_rft/reward.py",
+      "sha256": "aa0584c097423604151863fc88bd4f0da996d67c9bf6921f11a0c08b1ab7d117"
+    },
+    {
+      "file": "src/math_rft/train.py",
+      "sha256": "7345036ced7eca30b3dbceb6dd709c87a6b84afcd080dd2cb5d30264af418a64"
+    },
+    {
+      "file": "scripts/static_check.py",
+      "sha256": "a499b031f03c7ebc43a4e2647232dfaae8e2d4554a6359160fb4129588c64191"
+    },
+    {
+      "file": "configs/experiment.json",
+      "sha256": "d6e613312aa8448cd736408c900f455dce6614f3d6fe0c9925c7c00ffb8c5cd2"
+    },
+    {
+      "file": "configs/models.json",
+      "sha256": "0cd262505d81e02738e7b057eab81f81ad4fb5dc78f8a1d18f7ced57d67c3180"
+    },
+    {
+      "file": "configs/verl_base.yaml",
+      "sha256": "0885f5db16ee853b02b01ef68ea2f06d542e23464612d465b7c1c51b525b1308"
+    },
+    {
+      "file": "configs/verl_raw_agent.yaml",
+      "sha256": "4293d1af88b9ea973b59b8618dd8231a747a919975f68666af0de4b27ce761d0"
+    }
+  ],
+  "errors": [],
+  "ruff_output": "All checks passed!\n",
+  "not_executed": [
+    "training",
+    "model generation",
+    "dataset preparation",
+    "GPU/CUDA tests",
+    "dynamic unit tests"
+  ]
+}

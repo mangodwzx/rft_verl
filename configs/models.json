@@ -1,0 +1,30 @@
+{
+  "qwen3_1p7b": {
+    "repo_id": "Qwen/Qwen3-1.7B-Base",
+    "generation": "Qwen3",
+    "scale": "small",
+    "architecture": "Qwen3ForCausalLM",
+    "freeze_vision": false
+  },
+  "qwen3_4b": {
+    "repo_id": "Qwen/Qwen3-4B-Base",
+    "generation": "Qwen3",
+    "scale": "large",
+    "architecture": "Qwen3ForCausalLM",
+    "freeze_vision": false
+  },
+  "qwen35_2b": {
+    "repo_id": "Qwen/Qwen3.5-2B-Base",
+    "generation": "Qwen3.5",
+    "scale": "small",
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "freeze_vision": true
+  },
+  "qwen35_4b": {
+    "repo_id": "Qwen/Qwen3.5-4B-Base",
+    "generation": "Qwen3.5",
+    "scale": "large",
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "freeze_vision": true
+  }
+}

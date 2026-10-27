@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "verl_commit": "3c6d9b43b67c74ec343d77874cd8fa6e841523da",
+  "models": ["qwen3_1p7b", "qwen3_4b", "qwen35_2b", "qwen35_4b"],
+  "main_methods": ["rft", "grpo"],
+  "training_seeds": [42, 43, 44],
+  "split_seed": 20261025,
+  "pilot_size": 2048,
+  "dev_size": 256,
+  "diagnostic_size": 32,
+  "rollout_group_size": 8,
+  "max_k": 256,
+  "formal_samples_per_question": 1024,
+  "primary_k": 128,
+  "key_secondary_k": 256,
+  "report_ks": [1, 2, 4, 8, 16, 32, 64, 128, 256],
+  "evaluation_seed": 20261025,
+  "calibration_seed": 1701,
+  "probe_seed": 1702,
+  "bootstrap_replicates": 2000,
+  "deepmath_sizes": [8192, 16384],
+  "selection_rule": "final_predeclared_step; hyperparameters selected on dev only"
+}
