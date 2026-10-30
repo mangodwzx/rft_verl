@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import argparse
 import collections
+import json
 import math
 import re
 import unicodedata
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,7 @@ MATH500_REPO = "HuggingFaceH4/MATH-500"
 GSM8K_REPO = "openai/gsm8k"
 DEEPMATH_REPO = "zwhe99/DeepMath-103K"
 MATH_SUBJECTS = ("algebra", "counting_and_probability", "geometry", "intermediate_algebra", "number_theory", "prealgebra", "precalculus")
+REFERENCE_CORRECTIONS = Path(__file__).resolve().parents[2] / "configs/math_reference_corrections.json"
 
 
 def problem_key(problem: str) -> str:
@@ -38,14 +41,44 @@ def _text(row: dict[str, Any], key: str) -> str:
     return value.strip()
 
 
-def _level(value: Any) -> int:
+def _level(value: Any, *, allow_unknown: bool = False) -> int | None:
+    if allow_unknown and str(value).strip() == "Level ?":
+        return None
     match = re.fullmatch(r"(?:Level\s*)?([1-5])", str(value).strip(), flags=re.IGNORECASE)
     if not match:
         raise ValueError(f"Invalid MATH difficulty: {value!r}")
     return int(match.group(1))
 
 
+@lru_cache(maxsize=1)
+def _reference_corrections() -> dict[str, dict[str, str]]:
+    entries = json.loads(REFERENCE_CORRECTIONS.read_text(encoding="utf-8"))
+    return {entry["problem_sha256"]: entry for entry in entries}
+
+
+def math_reference_answer(problem: str, solution: str) -> tuple[str | None, dict | None]:
+    """Read historical MATH reference formatting without relaxing model grading.
+
+    Only a single unbraced digit followed by a math delimiter is supported;
+    arbitrary text and malformed final boxes are never guessed. Empty-box
+    source defects require an explicitly audited problem AND solution match.
+    """
+    answer = extract_boxed(solution)
+    if answer:
+        return answer, None
+    boxes = list(re.finditer(r"\\(?:boxed|fbox)\b", solution))
+    if boxes:
+        unbraced = re.match(r"\s+([0-9])\s*\$", solution[boxes[-1].end():])
+        if unbraced:
+            return unbraced[1], {"kind": "unbraced_digit_box", "solution_sha256": sha256_text(solution)}
+    correction = _reference_corrections().get(problem_key(problem))
+    if correction and sha256_text(solution) == correction["solution_sha256"]:
+        return correction["answer"], {"kind": "audited_empty_box", **correction}
+    return None, None
+
+
 def normalize_row(row: dict[str, Any], source: str, source_split: str) -> dict[str, Any]:
+    reference_adjustment = None
     if source == "deepmath":
         problem = _text(row, "question")
         answer = _text(row, "final_answer")
@@ -65,11 +98,17 @@ def normalize_row(row: dict[str, Any], source: str, source_split: str) -> dict[s
     else:
         problem = _text(row, "problem")
         solution = _text(row, "solution")
-        answer = row.get("answer") or extract_boxed(solution)
+        answer = row.get("answer")
+        if not answer:
+            if source == "math" and source_split == "train":
+                answer, reference_adjustment = math_reference_answer(problem, solution)
+            else:
+                answer = extract_boxed(solution)
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError(f"No reference answer extracted: {problem[:100]!r}")
         subject = _text(row, "subject" if "subject" in row else "type")
-        level, difficulty = _level(row["level"]), None
+        level = _level(row["level"], allow_unknown=(source == "math" and source_split == "train"))
+        difficulty = None
     key = problem_key(problem)
     original_id = str(row.get("unique_id") or row.get("id") or "")
     if source == "math500" and not original_id.startswith("test/"):
@@ -80,6 +119,7 @@ def normalize_row(row: dict[str, Any], source: str, source_split: str) -> dict[s
         "subject": subject, "level": level, "difficulty": difficulty,
         "split": source_split, "source_split": source_split, "data_source": source,
         "source_id": original_id, "problem_sha256": key,
+        "reference_answer_adjustment": reference_adjustment,
     }
 
 
@@ -187,6 +227,12 @@ def prepare(args: argparse.Namespace) -> None:
     if len(raw_train) != 7500:
         raise ValueError(f"Expected original MATH train's 7500 rows, got {len(raw_train)}; do not substitute a merged train/test mirror")
     train = [normalize_row(row, "math", "train") for row in raw_train]
+    reference_adjustments = [
+        {"id": row["id"], "problem_sha256": row["problem_sha256"], "answer": row["answer"],
+         **row["reference_answer_adjustment"]}
+        for row in train if row["reference_answer_adjustment"] is not None
+    ]
+    unknown_training_levels = [row["id"] for row in train if row["level"] is None]
     train, removed_train = _deduplicate(train, protected)
     dev, full = stratified_take(train, args.dev_size, args.seed, "development")
     pilot, _ = stratified_take(full, args.pilot_size, args.seed, "pilot")
@@ -223,6 +269,9 @@ def prepare(args: argparse.Namespace) -> None:
         "schema_version": 1, "split_seed": args.seed, "prompt_version": PROMPT_VERSION,
         "prompt_sha256": prompt_fingerprint(), "raw_chat_template": RAW_CHAT_TEMPLATE,
         "source_revisions": provenance, "removed_rows": removed,
+        "reference_answer_adjustments": reference_adjustments,
+        "reference_corrections_sha256": sha256_file(REFERENCE_CORRECTIONS),
+        "unknown_training_levels": unknown_training_levels,
         "deduplication": "NFKC + whitespace-normalized exact problem hash; no semantic-overlap guarantee",
         "full_train_includes_pilot": True, "full_train_excludes_dev": True,
         "sources": {"math": f"https://huggingface.co/datasets/{MATH_REPO}", "math500": f"https://huggingface.co/datasets/{MATH500_REPO}", "deepmath": f"https://huggingface.co/datasets/{DEEPMATH_REPO}"},

@@ -1,0 +1,14 @@
+[
+  {
+    "problem_sha256": "79595ba3b4cfcfe2199d686e80a0ccf75c9e41ebbb03a801cfaa02c740ac4680",
+    "solution_sha256": "5e1b77771c858fd0c05e248fc23f6cc172fa28b273ea4bbe40c69fd9b816993d",
+    "answer": "0",
+    "reason": "The original solution ends in an empty box. Every integer in the open interval is n!+k with 2<=k<n, and k is a proper divisor. Thus there are zero primes."
+  },
+  {
+    "problem_sha256": "81a7fe8e017d681cc815fff2e03a4e69fc15c6b6f768109943fcaf6ba54d22dd",
+    "solution_sha256": "641bf04313760e5b7b3660e328a8bdc073aaf748752ae313ccae7c04a8d33f74",
+    "answer": "0",
+    "reason": "The original solution ends in an empty box. For every 2<=n<=59, a prime divisor p of n also divides the product P of primes through 61. Thus p is a proper divisor of P+n and none of the 58 terms is prime."
+  }
+]

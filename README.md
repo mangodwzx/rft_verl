@@ -72,6 +72,8 @@ python -m math_rft.data prepare --output-dir data
 
 数据来源固定到不可变 revision；保留开发集、测试集与训练数据的分离，排除与固定示例的精确重叠。已有非空输出目录不会覆盖。已有本地原始数据时，可用 `--math-train-jsonl`、`--math500-jsonl`、`--gsm8k-jsonl` 指定保留官方字段的文件。
 
+原始 MATH train 有两条无花括号的数字答案框、两条空答案框和两条 `Level ?` 难度。数据读取支持前一种历史格式；两条空答案按题目及解答双指纹匹配 [审计修正表](configs/math_reference_corrections.json)，其数学答案均为 0。未知难度保留为 `null` 并独立分层，不猜测难度或删除题目。所有参考答案调整与未知难度题 ID 写入 `manifest.json`，原始解答保留；模型输出仍使用严格答案框判分规则。
+
 ## 3. GSM8K 流程检查
 
 ```bash
