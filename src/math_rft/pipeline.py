@@ -61,22 +61,24 @@ def main() -> None:
     models = json.loads((ROOT / "configs/models.json").read_text(encoding="utf-8"))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--models", nargs="+", choices=list(models), default=matrix["models"])
-    parser.add_argument("--methods", nargs="+", choices=("rft", "grpo", "rft_fixed", "grpo_fixed", "grpo_no_std", "grpo_positive", "rft_sum", "rft_pooled"), default=matrix["main_methods"])
+    parser.add_argument("--methods", nargs="+", choices=("rft", "grpo"), default=matrix["main_methods"])
     parser.add_argument("--seeds", type=int, nargs="+", default=matrix["training_seeds"])
     parser.add_argument("--stage", choices=("pilot", "full", "deepmath_8192", "deepmath_16384"), default="pilot")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output-dir", type=Path, default=Path("runs"))
     parser.add_argument("--evaluation-split", choices=("dev", "math500"), help="Default: dev for pilot; math500 for full/DeepMath")
-    parser.add_argument("--n", type=int, help="Default: dev64; formal1024 (k_max256)")
+    parser.add_argument("--n", type=int, help="Samples per question, default 256 for both dev and MATH-500")
     parser.add_argument("--evaluation-seed", type=int, default=matrix["evaluation_seed"])
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     parser.add_argument("--execute", action="store_true", help="Without this flag, print the plan and start no jobs")
     args = parser.parse_args()
     args.evaluation_split = args.evaluation_split or ("dev" if args.stage == "pilot" else "math500")
-    args.n = args.n if args.n is not None else (matrix["formal_samples_per_question"] if args.evaluation_split == "math500" else 64)
-    minimum_n = 256 if args.evaluation_split == "math500" else 1
+    args.n = args.n if args.n is not None else matrix[
+        "formal_samples_per_question" if args.evaluation_split == "math500" else "development_samples_per_question"
+    ]
+    minimum_n = matrix["max_k"]
     if args.n < minimum_n or not args.seeds or min(args.seeds) < 0 or len(set(args.seeds)) != len(args.seeds):
-        parser.error("Need sufficient evaluation samples and distinct nonnegative training seeds")
+        parser.error("This experiment requires n>=256 and distinct nonnegative training seeds; use evaluate --role debug for a smoke test")
     if len(set(args.models)) != len(args.models) or len(set(args.methods)) != len(args.methods):
         parser.error("Duplicate models or methods are not allowed")
     args.output_dir = args.output_dir.resolve()
@@ -92,7 +94,9 @@ def main() -> None:
     source_hashes = code_identity()
     for model in args.models:
         repo, revision = models[model]["repo_id"], revisions.get(model)
-        baseline_output = args.output_dir / "baselines" / model / f"{args.evaluation_split}.jsonl"
+        # Keep stage/sample budgets separate so later stages cannot accidentally
+        # resume a baseline generated with a different evaluation protocol.
+        baseline_output = args.output_dir / "baselines" / args.stage / model / f"{args.evaluation_split}.jsonl"
         invoke(evaluation(repo, args.data_dir, baseline_output, repo, args.n, "base", args.evaluation_seed, None, revision, args.evaluation_split), args.execute)
         evaluated: dict[str, list[Path]] = {}
         for method in args.methods:
@@ -151,14 +155,14 @@ def main() -> None:
                 invoke(evaluation(str(exported), args.data_dir, eval_output, repo, args.n, method,
                                   args.evaluation_seed, seed, None, args.evaluation_split), args.execute)
                 evaluated[method].append(eval_output)
-        reference = "grpo" if "grpo" in evaluated else "grpo_fixed" if "grpo_fixed" in evaluated else None
-        if reference:
-            for method in args.methods:
-                if method == reference:
-                    continue
-                invoke(["math_rft.analyze", "compare", "--left", *map(str, evaluated[method]),
-                        "--right", *map(str, evaluated[reference]), "--output-dir",
-                        str(args.output_dir / "comparisons" / args.stage / model / f"{method}_vs_{reference}")], args.execute)
+        if "rft" in evaluated and "grpo" in evaluated:
+            comparison_dir = args.output_dir / "comparisons" / args.stage / model / "rft_vs_grpo"
+            invoke(["math_rft.analyze", "compare", "--left", *map(str, evaluated["rft"]),
+                    "--right", *map(str, evaluated["grpo"]), "--output-dir", str(comparison_dir),
+                    "--bootstrap", str(matrix["bootstrap_replicates"])], args.execute)
+            invoke(["math_rft.plot", "--comparison", str(comparison_dir / "comparison.json"),
+                    "--baseline", str(baseline_output) + ".summary.json",
+                    "--output-dir", str(comparison_dir / "figures")], args.execute)
 
 
 if __name__ == "__main__":

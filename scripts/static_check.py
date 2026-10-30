@@ -20,7 +20,8 @@ def main() -> None:
     args = parser.parse_args()
     root = args.root.resolve()
     errors, checked, trees = [], [], {}
-    python_files = sorted((root / "src").rglob("*.py")) + sorted((root / "scripts").rglob("*.py"))
+    python_files = [path for directory in ("src", "scripts", "tests")
+                    for path in sorted((root / directory).rglob("*.py"))]
     for path in python_files:
         try:
             tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
@@ -73,6 +74,8 @@ def main() -> None:
             errors.append("Model registry and experiment matrix do not describe the same four models")
         if experiment["max_k"] != 256 or experiment["formal_samples_per_question"] < 256:
             errors.append("Formal sampling cannot support required pass@256")
+        if experiment["development_samples_per_question"] < 256:
+            errors.append("Pilot development sampling cannot support required pass@256")
         if experiment["report_ks"][-1] != 256 or len(set(experiment["training_seeds"])) < 3:
             errors.append("Missing k=256 endpoint or three distinct training seeds")
         if len(experiment["verl_commit"]) != 40:
@@ -86,8 +89,8 @@ def main() -> None:
                         constants[node.targets[0].id] = ast.literal_eval(node.value)
         if constants["VERL_COMMIT"] != experiment["verl_commit"]:
             errors.append("Training compatibility guard and experiment use different verl commits")
-        if not set(experiment["main_methods"]) <= set(constants["METHODS"]):
-            errors.append("Experiment requests an unimplemented training method")
+        if set(experiment["main_methods"]) != set(constants["METHODS"]) or set(constants["METHODS"]) != {"rft", "grpo"}:
+            errors.append("The focused experiment must expose only RFT and GRPO")
         registrations = {"register_adv_est": {"grpo"}, "register_policy_loss": set()}
         for node in trees["src/math_rft/algorithms.py"].body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -101,7 +104,7 @@ def main() -> None:
         errors.append(str(exc))
     ruff_output = None
     if args.ruff:
-        process = subprocess.run([sys.executable, "-m", "ruff", "check", "src", "scripts"],
+        process = subprocess.run([sys.executable, "-m", "ruff", "check", "src", "scripts", "tests"],
                                  cwd=root, text=True, capture_output=True, check=False)
         ruff_output = process.stdout + process.stderr
         if process.returncode:

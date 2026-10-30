@@ -15,13 +15,7 @@ from math_rft.prompts import RAW_CHAT_TEMPLATE, prompt_fingerprint
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 METHODS = {
     "rft": ("math_rft_question", "math_rft_nll", "seq-mean-token-mean"),
-    "rft_pooled": ("math_rft_pooled", "math_rft_nll", "seq-mean-token-mean"),
     "grpo": ("grpo", "math_grpo_clip", "seq-mean-token-mean"),
-    "rft_fixed": ("math_rft_question", "math_rft_nll", "seq-mean-token-sum-norm"),
-    "grpo_fixed": ("grpo", "math_grpo_clip", "seq-mean-token-sum-norm"),
-    "grpo_no_std": ("math_grpo_no_std", "math_grpo_clip", "seq-mean-token-sum-norm"),
-    "grpo_positive": ("math_grpo_positive", "math_grpo_clip", "seq-mean-token-sum-norm"),
-    "rft_sum": ("math_rft_question", "math_rft_nll", "seq-mean-token-sum"),
 }
 STAGES = ("pilot", "full", "deepmath_8192", "deepmath_16384")
 
@@ -104,7 +98,7 @@ def compose_config(args, model_path: str):
         "actor_rollout_ref.rollout.agent.agent_loop_config_path": str(PROJECT_ROOT / "configs/verl_raw_agent.yaml"),
         "actor_rollout_ref.actor.policy_loss.loss_mode": loss,
         "actor_rollout_ref.actor.loss_agg_mode": reduction,
-        "actor_rollout_ref.actor.loss_scale_factor": 4096 if reduction.endswith("-norm") else None,
+        "actor_rollout_ref.actor.loss_scale_factor": None,
         "algorithm.adv_estimator": advantage,
         "trainer.experiment_name": f"{args.model}_{args.method}_{args.stage}_s{args.seed}",
         "trainer.default_local_dir": str(run_dir / "checkpoints"),
@@ -142,6 +136,8 @@ def _validate_config(config, args):
         raise ValueError("Save synchronous full Hugging Face weights at each checkpoint")
     if actor.ppo_mini_batch_size != config.data.train_batch_size or actor.ppo_epochs != 1:
         raise ValueError("One update per fresh prompt batch is required; minibatch size must match train batch")
+    if config.data.gen_batch_size not in (None, config.data.train_batch_size):
+        raise ValueError("Generation batch size must match train_batch_size for one update per fresh prompt batch")
     if rollout.n < 2 or not rollout.do_sample or rollout.temperature != 1.0:
         raise ValueError("Use m>=2, stochastic sampling, temperature=1.0 for the defined objective")
     if rollout.top_p != 1.0 or rollout.top_k != -1:
@@ -153,11 +149,9 @@ def _validate_config(config, args):
     if actor.entropy_coeff != 0 or actor.use_kl_loss:
         raise ValueError("Use zero entropy/KL regularization for the controlled baseline")
     if actor.optim.weight_decay != 0:
-        raise ValueError("Weight decay must be zero to preserve zero-signal gradient controls")
-    # Adam momentum can still move parameters on a zero-gradient update; that
-    # practical optimizer effect is distinct from the analytical gradient.
+        raise ValueError("The main experiment uses zero weight decay for both methods")
     if not config.algorithm.norm_adv_by_std_in_grpo:
-        raise ValueError("Use --method grpo_no_std for the explicit nonstandardized control")
+        raise ValueError("Main GRPO requires group standard deviation normalization")
     if actor.strategy != "fsdp2" or actor.fsdp_config.strategy != "fsdp2":
         raise ValueError("Only the audited FSDP2 route is supported")
     if config.actor_rollout_ref.model.lora_rank or config.actor_rollout_ref.model.lora.rank:
@@ -176,11 +170,11 @@ def _validate_config(config, args):
     expected = METHODS[args.method]
     if (config.algorithm.adv_estimator, actor.policy_loss.loss_mode, actor.loss_agg_mode) != expected:
         raise ValueError("Algorithm/loss/reduction must agree with --method; use an explicit method")
-    if expected[2].endswith("-norm") and actor.loss_scale_factor != 4096:
-        raise ValueError("Mechanism controls use a fixed 4096-token denominator")
     if rollout.max_model_len < config.data.max_prompt_length + config.data.max_response_length:
         raise ValueError("rollout.max_model_len must cover prompt + response budgets")
     world_size = config.trainer.nnodes * config.trainer.n_gpus_per_node
+    if world_size <= 0 or config.data.train_batch_size <= 0:
+        raise ValueError("GPU world size and training batch size must be positive")
     if (config.data.train_batch_size * rollout.n) % world_size:
         raise ValueError("Global rollout batch must be divisible by the FSDP world size")
 

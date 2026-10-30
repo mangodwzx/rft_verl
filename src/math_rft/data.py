@@ -190,7 +190,6 @@ def prepare(args: argparse.Namespace) -> None:
     train, removed_train = _deduplicate(train, protected)
     dev, full = stratified_take(train, args.dev_size, args.seed, "development")
     pilot, _ = stratified_take(full, args.pilot_size, args.seed, "pilot")
-    diagnostic, _ = stratified_take(pilot, min(32, len(pilot)), args.seed, "diagnostic")
     if not ({(row["subject"], row["level"]) for row in full} <= {(row["subject"], row["level"]) for row in pilot}):
         raise ValueError("Pilot selection does not cover every available subject/difficulty stratum")
     raw_gsm = _load_source(GSM8K_REPO, "main", "train", args.gsm8k_revision, args.gsm8k_jsonl, provenance, "gsm8k")
@@ -200,7 +199,7 @@ def prepare(args: argparse.Namespace) -> None:
     gsm = sorted(gsm, key=lambda row: sha256_text(f"{args.seed}:gsm8k:{row['id']}"))[:args.debug_size]
     if len(gsm) != args.debug_size:
         raise ValueError("Too few unique GSM8K examples for the requested debug set")
-    splits = {"pilot": pilot, "dev": dev, "full": full, "diagnostic": diagnostic, "math500": test, "gsm8k_debug": gsm}
+    splits = {"pilot": pilot, "dev": dev, "full": full, "math500": test, "gsm8k_debug": gsm}
     removed = {"math_train": removed_train, "gsm8k": removed_gsm}
     if args.deepmath_size:
         raw_deep = _load_source(DEEPMATH_REPO, None, "train", args.deepmath_revision, args.deepmath_jsonl, provenance, "deepmath")
@@ -211,8 +210,8 @@ def prepare(args: argparse.Namespace) -> None:
             raise ValueError("Too few non-overlapping DeepMath examples")
         splits[f"deepmath_{args.deepmath_size}"] = deep
         removed["deepmath"] = removed_deep
-    # The diagnostic subset is nested in pilot, which is nested in full.
-    nested_training = {"pilot", "full", "diagnostic"}
+    # Pilot is a fixed subset of full; both exclude dev and test.
+    nested_training = {"pilot", "full"}
     for first, left in splits.items():
         for second, right in splits.items():
             if first >= second or {first, second} <= nested_training:
@@ -226,7 +225,6 @@ def prepare(args: argparse.Namespace) -> None:
         "source_revisions": provenance, "removed_rows": removed,
         "deduplication": "NFKC + whitespace-normalized exact problem hash; no semantic-overlap guarantee",
         "full_train_includes_pilot": True, "full_train_excludes_dev": True,
-        "diagnostic_subset_of_pilot": True,
         "sources": {"math": f"https://huggingface.co/datasets/{MATH_REPO}", "math500": f"https://huggingface.co/datasets/{MATH500_REPO}", "deepmath": f"https://huggingface.co/datasets/{DEEPMATH_REPO}"},
         "splits": {},
     }

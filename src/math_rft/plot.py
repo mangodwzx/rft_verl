@@ -1,7 +1,8 @@
 """Render saved evaluation summaries to standalone PNG/PDF figures.
 
 This command never loads a model or generates samples. Install the optional
-``plots`` dependency group, then explicitly invoke the CLI after evaluation.
+``plots`` dependency group. A comparison alone renders means across all supplied
+training seeds; an optional baseline adds the Base model to those curves.
 """
 from __future__ import annotations
 
@@ -40,16 +41,55 @@ def setup_axis(axis, ks: list[int], title: str, ylabel: str) -> None:
     axis.spines[["top", "right"]].set_visible(False)
 
 
+def comparison_summaries(comparison: dict, baseline: dict | None = None) -> tuple[list[dict], list[str]]:
+    """Adapt aggregate comparison means to the same plotting path as summaries."""
+    if comparison.get("direction") != "left_minus_right":
+        raise ValueError("Comparison must explicitly define left_minus_right")
+    question_ids = comparison["question_ids"]
+    if baseline is not None and (
+        baseline["n"] != comparison["n"] or [row["id"] for row in baseline["questions"]] != question_ids
+    ):
+        raise ValueError("Baseline and comparison must have identical n and ordered question IDs")
+    questions = baseline["questions"] if baseline else [{"id": qid, "subject": None, "level": None} for qid in question_ids]
+    summaries, labels = ([baseline], ["Base"]) if baseline else ([], [])
+    for side in ("left", "right"):
+        groups = {}
+        for group in ("all", "level_4_5"):
+            estimates = comparison["aggregate"].get(group, {})
+            if any(f"{side}_mean" not in estimate for estimate in estimates.values()):
+                raise ValueError("Comparison lacks method means; rerun math_rft.analyze compare")
+            groups[group] = {
+                "questions": next(iter(estimates.values()))["questions_per_seed"] if estimates else 0,
+                "pass_at_k": {k: estimate[f"{side}_mean"] for k, estimate in estimates.items()},
+            }
+        ks = sorted(int(k) for k in groups["all"]["pass_at_k"])
+        if not ks:
+            raise ValueError("Comparison has no all-question curve")
+        summaries.append({"complete": True, "questions": questions, "groups": groups,
+                          "n": comparison["n"], "ks": ks})
+        labels.append(f"{comparison[f'{side}_method'].upper()} (mean of {len(comparison['paired_training_seeds'])} seed(s))")
+    return summaries, labels
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--summaries", type=Path, nargs="+", required=True)
-    parser.add_argument("--labels", nargs="+", required=True)
+    parser.add_argument("--summaries", type=Path, nargs="+")
+    parser.add_argument("--labels", nargs="+")
     parser.add_argument("--comparison", type=Path)
+    parser.add_argument("--baseline", type=Path, help="Add Base to aggregate comparison curves; omit --summaries/--labels")
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args(argv)
-    if len(args.summaries) != len(args.labels) or len(set(args.labels)) != len(args.labels):
-        parser.error("Provide one distinct --labels entry per --summaries file")
-    summaries = [read_summary(path) for path in args.summaries]
+    comparison = json.loads(args.comparison.read_text(encoding="utf-8")) if args.comparison else None
+    if args.summaries:
+        if not args.labels or len(args.summaries) != len(args.labels) or len(set(args.labels)) != len(args.labels):
+            parser.error("Provide one distinct --labels entry per --summaries file")
+        if args.baseline:
+            parser.error("--baseline is for aggregate comparison curves; omit --summaries/--labels")
+        summaries = [read_summary(path) for path in args.summaries]
+    else:
+        if not comparison or args.labels:
+            parser.error("Provide --comparison (optionally --baseline), or --summaries with --labels")
+        summaries, args.labels = comparison_summaries(comparison, read_summary(args.baseline) if args.baseline else None)
     # In particular, do not overlay a complete MATH-500 run and a pilot subset.
     reference_questions = [(row["id"], row["subject"], row["level"]) for row in summaries[0]["questions"]]
     for summary in summaries[1:]:
@@ -81,8 +121,7 @@ def main(argv: list[str] | None = None) -> None:
         axis.legend(frameon=False, loc="best")
         save_figure(figure, args.output_dir, f"pass_at_k_{group_name}")
         plt.close(figure)
-    if args.comparison:
-        comparison = json.loads(args.comparison.read_text(encoding="utf-8"))
+    if comparison:
         if comparison.get("direction") != "left_minus_right":
             raise ValueError("Comparison must explicitly define left_minus_right")
         if comparison["n"] != summaries[0]["n"]:
@@ -107,10 +146,17 @@ def main(argv: list[str] | None = None) -> None:
                 highs.append(100 * high)
             figure, axis = plt.subplots(figsize=(7.2, 4.6), layout="constrained")
             label = f"{comparison['left_method']} − {comparison['right_method']}"
+            individual_values = []
+            for index, entry in enumerate(comparison["per_seed"]):
+                curve = entry["groups"][group_name]["pass_at_k_delta"]
+                values = [100 * curve[str(k)]["mean"] for k in ks]
+                individual_values.extend(values)
+                axis.plot(ks, values, color="#94a3b8",
+                          alpha=0.6, linewidth=0.8, label="Individual training seeds" if index == 0 else None)
             axis.plot(ks, means, marker="o", linewidth=1.7, color="#2563eb", label=label)
-            axis.fill_between(ks, lows, highs, alpha=0.18, color="#2563eb", label="95% paired bootstrap CI")
+            axis.fill_between(ks, lows, highs, alpha=0.18, color="#2563eb", label="Pointwise 95% paired bootstrap CI")
             axis.axhline(0, color="#4b5563", linewidth=0.9, linestyle="--")
-            bound = max(1.0, max(abs(value) for value in [*lows, *highs]) * 1.15)
+            bound = max(1.0, max(abs(value) for value in [*lows, *highs, *individual_values]) * 1.15)
             axis.set_ylim(-bound, bound)
             setup_axis(axis, ks, f"{group_label} · {len(comparison['paired_training_seeds'])} paired seed(s)",
                        "Difference in pass@k (percentage points)")

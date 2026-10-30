@@ -9,13 +9,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import statistics
 from pathlib import Path
 from typing import Any
 
 from math_rft.evaluate import (
     artifact_paths, atomic_json, build_summary, canonical_hash, read_existing, read_jsonl,
 )
-from math_rft.metrics import DEFAULT_KS, hierarchical_delta_ci, mean_ci, paired_delta_ci, pass_at_k
+from math_rft.metrics import (
+    DEFAULT_KS, describe_gap_curve, hierarchical_delta_ci, mean_ci, paired_delta_ci, pass_at_k,
+)
 
 
 def load_run(path: Path) -> dict[str, Any]:
@@ -116,6 +119,44 @@ def pair_seed(left: dict, right: dict) -> int | None:
     return ls if ls is not None else rs
 
 
+def gap_trends(pairs: list[tuple[dict, dict]], group_ids: dict[str, list[str]], n: int,
+               repeats: int, seed: int) -> dict:
+    """Describe means and estimate predeclared high-k changes using paired data."""
+    ks = [k for k in DEFAULT_KS if k <= n]
+    result = {"per_seed": [], "aggregate": {}, "fixed_k_changes": {},
+              "interpretation": [
+                  "Signed delta is left minus right; absolute gap is the magnitude of that mean delta.",
+                  "Peak locations and curve shapes are descriptive, restricted to the reported k grid.",
+                  "Fixed-k changes compare deltas on the same questions and training seeds; intervals are pointwise.",
+                  "A negative signed change does not necessarily mean the absolute gap shrank.",
+              ]}
+    for left, right in pairs:
+        result["per_seed"].append({"training_seed": pair_seed(left, right), "groups": {}})
+    for group, ids in group_ids.items():
+        if not ids:
+            continue
+        differences = {
+            k: [[pass_at_k(n, left["counts"][qid]["correct"], k)
+                 - pass_at_k(n, right["counts"][qid]["correct"], k) for qid in ids]
+                for left, right in pairs] for k in ks
+        }
+        seed_means = [[statistics.fmean(differences[k][index]) for k in ks] for index in range(len(pairs))]
+        for entry, values in zip(result["per_seed"], seed_means, strict=True):
+            entry["groups"][group] = describe_gap_curve(ks, values)
+        means = [statistics.fmean(values[index] for values in seed_means) for index in range(len(ks))]
+        result["aggregate"][group] = describe_gap_curve(ks, means)
+        result["fixed_k_changes"][group] = {}
+        for low, high in ((64, 128), (128, 256), (64, 256)):
+            if low not in differences or high not in differences:
+                continue
+            changes = [[b - a for a, b in zip(low_values, high_values, strict=True)]
+                       for low_values, high_values in zip(differences[low], differences[high], strict=True)]
+            estimate = hierarchical_delta_ci(changes, repeats=repeats, seed=seed)
+            estimate.update({"lower_k": low, "higher_k": high, "direction": "delta_at_higher_k_minus_delta_at_lower_k"})
+            result["fixed_k_changes"][group][f"{high}_minus_{low}"] = estimate
+    return result
+
+
 def compare(args: argparse.Namespace) -> None:
     if len(args.left) != len(args.right) or not args.left:
         raise ValueError("Supply equally many --left and --right paths, ordered by paired training seed")
@@ -179,9 +220,16 @@ def compare(args: argparse.Namespace) -> None:
                             - pass_at_k(n, right["counts"][qid]["correct"], k) for qid in ids]
                            for left, right in pairs]
             estimate = hierarchical_delta_ci(differences, repeats=args.bootstrap, seed=args.seed)
+            estimate["left_mean"] = statistics.fmean(
+                pass_at_k(n, left["counts"][qid]["correct"], k) for left, _ in pairs for qid in ids
+            )
+            estimate["right_mean"] = statistics.fmean(
+                pass_at_k(n, right["counts"][qid]["correct"], k) for _, right in pairs for qid in ids
+            )
             aggregate[group_name][str(k)] = estimate
             aggregate_rows.append({"group": group_name, "k": k, "training_seeds": len(pairs),
-                                   "questions": len(ids), "delta_left_minus_right": estimate["mean"],
+                                   "questions": len(ids), "left_mean": estimate["left_mean"],
+                                   "right_mean": estimate["right_mean"], "delta_left_minus_right": estimate["mean"],
                                    "seed_std": estimate["seed_std"],
                                    "ci95_low": estimate["ci95"][0], "ci95_high": estimate["ci95"][1]})
     output = {"direction": "left_minus_right", "base_model": reference_left["config"]["base_model"],
@@ -194,10 +242,29 @@ def compare(args: argparse.Namespace) -> None:
                   "CI resamples questions and paired training seeds, not individual completions.",
                   "The intervals are percentile bootstrap intervals, not exact fixed-benchmark binomial intervals.",
                   "Subject/level curves and non-primary k values are exploratory; no multiple-testing adjustment is implied.",
-                  "At n=k, pass@k is observed coverage. Default n1024 provides more information for k<=256.",
+                  "At n=k, pass@k is observed coverage; larger n gives a finer per-question estimate at the same k.",
                   "With only a few training seeds, seed uncertainty remains poorly estimated; report each seed.",
               ]}
+    trends = gap_trends(pairs, group_ids, n, args.bootstrap, args.seed)
+    output["trends"] = trends
     atomic_json(args.output_dir / "comparison.json", output)
+    atomic_json(args.output_dir / "trend_summary.json", trends)
+    trend_rows = []
+    for group, descriptions in trends["aggregate"].items():
+        for quantity in ("signed_delta", "absolute_gap"):
+            trend_rows.append({"scope": "aggregate", "training_seed": "", "group": group,
+                               "quantity": quantity, **descriptions[quantity]})
+    for entry in trends["per_seed"]:
+        for group, descriptions in entry["groups"].items():
+            for quantity in ("signed_delta", "absolute_gap"):
+                trend_rows.append({"scope": "per_seed", "training_seed": entry["training_seed"], "group": group,
+                                   "quantity": quantity, **descriptions[quantity]})
+    write_csv(args.output_dir / "trend_summary.csv", trend_rows)
+    write_csv(args.output_dir / "high_k_changes.csv", [
+        {"group": group, "lower_k": value["lower_k"], "higher_k": value["higher_k"],
+         "delta_change": value["mean"], "ci95_low": value["ci95"][0], "ci95_high": value["ci95"][1]}
+        for group, changes in trends["fixed_k_changes"].items() for value in changes.values()
+    ])
     write_csv(args.output_dir / "per_seed_deltas.csv", csv_rows)
     write_csv(args.output_dir / "aggregate_deltas.csv", aggregate_rows)
     print(f"Wrote {args.output_dir / 'comparison.json'}")

@@ -1,7 +1,7 @@
 {
   "check_type": "static_only",
   "status": "passed",
-  "checked_at_utc": "2026-10-25T07:23:59.665676+00:00",
+  "checked_at_utc": "2026-10-30T17:12:49.911493+00:00",
   "files": [
     {
       "file": "src/math_rft/__init__.py",
@@ -9,11 +9,11 @@
     },
     {
       "file": "src/math_rft/algorithms.py",
-      "sha256": "28283481d4bd9ae868dc49601e7a20f878a120d847a640ab927df47df6424337"
+      "sha256": "c2d682e3a4a0ccc8035aefb14f349bd21c3700d9a1c5d80c91332f229fedaf8e"
     },
     {
       "file": "src/math_rft/analyze.py",
-      "sha256": "43acfbb45862f05b6fb05bd9e31fd4816725005d5aa83f351afd029c6058e104"
+      "sha256": "35f20c480e143a1e25dc95fa34a99194fef491683abcc4201aaf2d835a460cf9"
     },
     {
       "file": "src/math_rft/compatibility.py",
@@ -21,15 +21,11 @@
     },
     {
       "file": "src/math_rft/data.py",
-      "sha256": "877e5454024c4524f4bcdd6cf495750b2fe195fa65ca5f8d0d62c4574e58a662"
-    },
-    {
-      "file": "src/math_rft/diagnose.py",
-      "sha256": "b2d46850c74f66f5fffcfe287cb2ad10e0b6f3fc026fa67c3472f6823f9045c7"
+      "sha256": "587ec8a5ab66fd5bdd7d004e92d13636c11794efa4b035cb52b8490f637b2994"
     },
     {
       "file": "src/math_rft/evaluate.py",
-      "sha256": "f8278692b8c7050d28bfacebcc7e9e45a1b69b6cc7f12ea15ebb377f0ed5892a"
+      "sha256": "572677fb90ad4a1ff5964580fa71c2b950e2ffadbf3d76f83b6b5e93208379bf"
     },
     {
       "file": "src/math_rft/io_utils.py",
@@ -37,15 +33,15 @@
     },
     {
       "file": "src/math_rft/metrics.py",
-      "sha256": "c551735eefb862446c91af19cb287c00d96f77e269c792e0884b873a741674ed"
+      "sha256": "b00f0c11912b9a1786a3b791f6a33faefd191697ff91eecc939bf113fcf62e64"
     },
     {
       "file": "src/math_rft/pipeline.py",
-      "sha256": "bd07806c5be2c48c1c66867baab5de3f77663a99092a1d6dbfcaadce043a5331"
+      "sha256": "001cb9df88b33023b750b00b42c810b76327a0f80ae966c2d5c439054235f013"
     },
     {
       "file": "src/math_rft/plot.py",
-      "sha256": "7ae73395e4c63458497011c411e8d548fd0615e7d7c0e9ea7ba51c8b3f743800"
+      "sha256": "ab3ce3a5a7284f02819a99c8078baa5e0cc10945644f1c6899b94501ca1f2a3f"
     },
     {
       "file": "src/math_rft/prompts.py",
@@ -61,15 +57,23 @@
     },
     {
       "file": "src/math_rft/train.py",
-      "sha256": "7345036ced7eca30b3dbceb6dd709c87a6b84afcd080dd2cb5d30264af418a64"
+      "sha256": "e7c00cb1b63e8c01bed5aa73850ac25f55c2c1bc7d02c6a6e89e5099c5ed8b1b"
     },
     {
       "file": "scripts/static_check.py",
-      "sha256": "a499b031f03c7ebc43a4e2647232dfaae8e2d4554a6359160fb4129588c64191"
+      "sha256": "e90d91f73818cc9c0ffd96ea01c8c52212f9c127b934eecfaef94a810c924c1a"
+    },
+    {
+      "file": "tests/test_analysis.py",
+      "sha256": "5fd3b8e983794743509ce2ac4d423e3c59e3b6370d15941d7f0dd4ace0d41965"
+    },
+    {
+      "file": "tests/test_pipeline.py",
+      "sha256": "20a77cf76fc2b6e4bf2b6bc07be2bebf44c2b69dc567cc1a2b86b45ae46f3c5c"
     },
     {
       "file": "configs/experiment.json",
-      "sha256": "d6e613312aa8448cd736408c900f455dce6614f3d6fe0c9925c7c00ffb8c5cd2"
+      "sha256": "3c95f70619f83655d32a6ba4404279c7c3be8023bcd5c722a34d710ed45e1c3e"
     },
     {
       "file": "configs/models.json",
@@ -85,7 +89,7 @@
     }
   ],
   "errors": [],
-  "ruff_output": "All checks passed!\n",
+  "ruff_output": null,
   "not_executed": [
     "training",
     "model generation",

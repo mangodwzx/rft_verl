@@ -1,4 +1,4 @@
-"""verl extensions: online question-balanced RFT and GRPO mechanism controls.
+"""verl extensions for online question-balanced RFT and clipped GRPO.
 
 Imported through ``actor_rollout_ref.model.external_lib`` in the controller and
 each Ray worker. Never compute success counts again inside a shuffled minibatch.
@@ -48,51 +48,6 @@ def question_success_weights(token_level_rewards, response_mask, index=None, con
     return weights, weights.clone()
 
 
-@register_adv_est("math_rft_pooled")
-def pooled_success_weights(token_level_rewards, response_mask, index=None, config=None, **kwargs):
-    """Global successful-response mean; explicit task-weighting ablation.
-
-    Compute the denominator on the entire original rollout batch before any
-    rank split or minibatch shuffle. This intentionally differs from main RFT.
-    """
-    del config, kwargs
-    with torch.no_grad():
-        scores, _ = _groups(token_level_rewards, response_mask, index)
-        weights = scores * len(scores) / scores.sum().clamp_min(1)
-        weights = weights.unsqueeze(-1) * response_mask
-    return weights, weights.clone()
-
-
-def _grpo(token_level_rewards, response_mask, index, *, standardize, positive_only):
-    with torch.no_grad():
-        scores, groups = _groups(token_level_rewards, response_mask, index)
-        advantages = torch.zeros_like(scores)
-        for rows in groups.values():
-            ids = torch.tensor(rows, device=scores.device, dtype=torch.long)
-            group_scores = scores[ids]
-            values = group_scores - group_scores.mean()
-            if standardize:
-                # Matches pinned verl's torch.std(sample, correction=1) + 1e-6.
-                values = values / (group_scores.std(unbiased=True) + 1e-6)
-            if positive_only:
-                values = values.clamp_min(0)
-            advantages[ids] = values
-        advantages = advantages.unsqueeze(-1) * response_mask
-    return advantages, advantages.clone()
-
-
-@register_adv_est("math_grpo_no_std")
-def grpo_no_std(token_level_rewards, response_mask, index=None, config=None, **kwargs):
-    del config, kwargs
-    return _grpo(token_level_rewards, response_mask, index, standardize=False, positive_only=False)
-
-
-@register_adv_est("math_grpo_positive")
-def grpo_positive(token_level_rewards, response_mask, index=None, config=None, **kwargs):
-    del config, kwargs
-    return _grpo(token_level_rewards, response_mask, index, standardize=True, positive_only=True)
-
-
 @register_policy_loss("math_rft_nll")
 def rft_nll(old_log_prob, log_prob, advantages, response_mask,
             loss_agg_mode="seq-mean-token-mean", config=None,
@@ -107,8 +62,8 @@ def rft_nll(old_log_prob, log_prob, advantages, response_mask,
         raise ValueError("RFT requires verl's original global rollout batch denominator")
     if rollout_is_weights is not None:
         raise ValueError("Rollout IS/rejection correction must be disabled for this RFT definition")
-    if loss_agg_mode not in {"seq-mean-token-mean", "seq-mean-token-sum", "seq-mean-token-sum-norm"}:
-        raise ValueError("RFT must use a per-sequence aggregation, never a global token mean")
+    if loss_agg_mode != "seq-mean-token-mean":
+        raise ValueError("Main RFT averages tokens per response, then averages the original rollout batch")
     weights = advantages.detach()
     if torch.any(weights < 0):
         raise ValueError("RFT success weights cannot be negative")

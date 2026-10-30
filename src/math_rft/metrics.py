@@ -32,6 +32,45 @@ def pass_curve(n: int, correct: int, ks: Sequence[int] = DEFAULT_KS) -> dict[str
     return {str(k): pass_at_k(n, correct, k) for k in ks if k <= n}
 
 
+def describe_gap_curve(ks: Sequence[int], deltas: Sequence[float]) -> dict:
+    """Describe an observed grid without turning a selected peak into a test.
+
+    Signed method differences and absolute distances can have different shapes.
+    Peak ties use the smallest k. These summaries carry no significance claim.
+    """
+    if not ks or len(ks) != len(deltas) or list(ks) != sorted(set(ks)):
+        raise ValueError("Need equally sized values and strictly increasing k values")
+    if any(type(k) is not int or k < 1 for k in ks) or any(not math.isfinite(d) for d in deltas):
+        raise ValueError("Need positive integer k values and finite differences")
+
+    def describe(values: Sequence[float]) -> dict:
+        tolerance = 1e-12
+        maximum = max(values)
+        peak = next(i for i, value in enumerate(values) if maximum - value <= tolerance)
+        increments = [b - a for a, b in zip(values[:-1], values[1:], strict=True)]
+        rising = any(step > tolerance for step in increments)
+        falling = any(step < -tolerance for step in increments)
+        if not rising and not falling:
+            shape = "flat"
+        elif not falling:
+            shape = "nondecreasing"
+        elif not rising:
+            shape = "nonincreasing"
+        elif all(step >= -tolerance for step in increments[:peak]) and all(
+            step <= tolerance for step in increments[peak:]
+        ):
+            shape = "rise_then_fall"
+        else:
+            shape = "nonmonotonic"
+        return {"shape_on_reported_grid": shape, "peak_k": ks[peak], "peak_value": values[peak],
+                "first_k": ks[0], "first_value": values[0], "last_k": ks[-1], "last_value": values[-1],
+                "rise_from_first_to_peak": values[peak] - values[0],
+                "drop_from_peak_to_last": values[peak] - values[-1]}
+
+    return {"signed_delta": describe(deltas), "absolute_gap": describe([abs(value) for value in deltas]),
+            "note": "Descriptive on the reported k grid only; selected peaks are not significance tests."}
+
+
 def quantile(values: Sequence[float], probability: float) -> float:
     if not values or not 0.0 <= probability <= 1.0:
         raise ValueError("Quantiles require nonempty values and probability in [0,1]")

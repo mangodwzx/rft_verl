@@ -117,13 +117,13 @@ def load_data(path: Path, role: str, n: int) -> list[dict]:
         for field in ("problem", "prompt", "answer"):
             if not isinstance(row[field], str) or not row[field].strip():
                 raise ValueError(f"{row['id']}: {field} must be nonempty text")
-        if role in {"development", "calibration", "probe"} and (
+        if role == "development" and (
             row["split"] in {"test", "math500"} or "math500" in str(row["data_source"]).lower().replace("-", "")
         ):
-            raise ValueError("Development/calibration/probe samples must not use the formal test set")
+            raise ValueError("Development samples must not use the formal test set")
     if role == "formal":
         if len(rows) != 500 or n < 256:
-            raise ValueError("Formal evaluation requires all 500 MATH-500 questions and n>=256 (default1024)")
+            raise ValueError("Formal evaluation requires all 500 MATH-500 questions and n>=256 (default256)")
         if not all("math500" in (str(r["data_source"]) + str(r["split"])).lower().replace("-", "") for r in rows):
             raise ValueError("Formal evaluation requires the prepared MATH-500 split")
     return rows
@@ -196,8 +196,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--revision")
     result.add_argument("--data", type=Path, required=True)
     result.add_argument("--output", type=Path, required=True)
-    result.add_argument("--role", choices=("formal", "development", "calibration", "probe", "debug"), default="formal")
-    result.add_argument("--n", type=int, default=1024)
+    result.add_argument("--role", choices=("formal", "development", "debug"), default="formal")
+    result.add_argument("--n", type=int, default=256)
     result.add_argument("--seed", type=int, default=20261025)
     result.add_argument("--training-seed", type=int)
     result.add_argument("--method", default="base")
@@ -339,9 +339,7 @@ def run(args: argparse.Namespace, rows: list[dict], paths: dict[str, Path]) -> N
                 record = {"id": row["id"], "sample_index": index, "seed": seed,
                           "text": completion.text, "score": int(score["score"]),
                           "grader_status": score["status"], "extracted_answer": score["extracted_answer"],
-                          # Exact generated IDs are authoritative for gradient
-                          # diagnostics; do not retokenize decoded text (which
-                          # omits special tokens such as a generated EOS).
+                          # Preserve actual generated lengths, including EOS.
                           "response_token_ids": list(completion.token_ids),
                           "finish_reason": completion.finish_reason, "stop_reason": completion.stop_reason}
                 records.append(record)

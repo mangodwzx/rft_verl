@@ -1,6 +1,27 @@
-# 静态审查记录
+# 检查记录
 
-检查日期：2026-10-25。机器可读的最终文件哈希、检查时间与状态见 `STATIC_CHECKS.json`。
+## 2026-10-31：收敛到 RFT / GRPO 大 k 对比
+
+本次已通过 Python AST/配置检查、14 项 CPU 单元测试和 `git diff --check`。CPU 测试覆盖 pass@k 精确值、非法采样预算、差值与绝对差距的趋势区分、合成双种子完整账本的配对统计和绘图输入适配、不完整账本拒绝，以及完整矩阵计划、评测/比较/绘图路径、正式集要求和开发集防测试集泄漏。另用合成 7500 题验证了划分大小、互斥、嵌套、确定性和分层覆盖。
+
+机器可读的当前静态检查结果及文件指纹见 `STATIC_CHECKS.json`；其中 `not_executed` 仅表示静态脚本本身不执行这些任务，CPU 测试是单独运行的。
+
+系统当前只有 Python 3.10。CPU 测试使用它运行；静态脚本临时使用已安装的 `pip._vendor.tomli` 作为 `tomllib`，未修改项目 Python 版本要求。正式训练仍按安装脚本使用 Python 3.12。
+
+本次没有下载模型或数据、安装 GPU 训练栈、加载模型、运行 Ray/CUDA、实际训练或真实生成/评测。环境缺少 matplotlib 和 Ruff，尚未验证 PNG/PDF 渲染，也未重跑 Ruff。检查依赖安装请求被中断，未新增依赖。Qwen3.5 视觉冻结及 verl 适配沿用原实现，仍需实际 GPU 验证。
+
+安装 README 中的环境后可以复查：
+
+```bash
+python scripts/static_check.py --ruff --report STATIC_CHECKS.json
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+## 历史审查：2026-10-25（修改前版本）
+
+以下保留原始审查记录；其中 n1024、梯度诊断和“未执行动态测试”等描述仅适用于当时版本，不代表当前配置或本次验证。
+
+检查日期：2026-10-25。
 
 ## 已执行的检查
 
