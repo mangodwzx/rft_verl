@@ -40,6 +40,26 @@ source vendor/verl/.venv/bin/activate
 
 脚本使用固定 verl 提交的 `uv.lock` 安装 Python 3.12 GPU 环境，再安装本项目、判题和绘图依赖；环境清单保存到 `vendor/environment.freeze.txt`。后续命令统一使用这个已激活的 Python。安装本身不启动实验。
 
+**当前服务器使用 A800 + 570 驱动，而固定环境使用 CUDA 13。** 可以使用 NVIDIA 官方的前向兼容库，无需更换系统驱动：
+
+```bash
+# 首次配置需要；仅下载、校验并解压到项目 vendor，不安装系统驱动。
+bash scripts/install_cuda_compat.sh
+
+# 此后每个新终端/tmux 会话使用这一条，替代仅激活 .venv 的命令。
+source scripts/activate.sh
+```
+
+`activate.sh` 同时设置数据盘上的 Python/包/模型缓存和临时目录，并在 535/570 驱动上为本项目的进程加载兼容库。默认运行目录为 `/mnt/public2/wangzixu/rft_runtime`；兼容库位于 `vendor/cuda-compat-13-0/`。它适用于本文的数据中心 GPU 环境，不代表任意显卡/驱动组合都受支持。[NVIDIA 兼容矩阵](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html)
+
+本机已通过真实 CUDA 分配、BF16 反向传播、FlashAttention 前后向、vLLM CuMem sleep/wake 和单 rank NCCL 检查；这不等于已验证模型生成或多卡训练。复查时，先激活上述脚本，再选择自己可用的一张 GPU，例如：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/check_gpu_runtime.py
+```
+
+兼容库必须在启动 Python 和 Ray 之前设置；已有进程不会因另一个终端的 `source` 自动更新。请从激活后的终端启动新的实验进程，不复用激活前启动的 Ray 实例。不要停止共享服务器上其他人的 Ray 任务。
+
 训练默认使用 **8 张 GPU**。可在下面的 pipeline/train 命令中加入 `--set trainer.n_gpus_per_node=4` 调整卡数；全局回答批大小必须能被 GPU 数整除。卡数设置不保证模型和 batch 能装入显存，实际部署仍需验证。
 
 ## 2. 准备数据

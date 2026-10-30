@@ -25,4 +25,5 @@ fi
 uv pip install --python "$VERL_DIR/.venv/bin/python" -e "$ROOT[static,plots]"
 uv pip freeze --python "$VERL_DIR/.venv/bin/python" > "$ROOT/vendor/environment.freeze.txt"
 echo "Activate with: source '$VERL_DIR/.venv/bin/activate'"
+echo 'For A800 with a 570 driver and this CUDA 13 stack: bash scripts/install_cuda_compat.sh; source scripts/activate.sh'
 echo 'Setup complete. No data preparation, generation, or training was started.'
