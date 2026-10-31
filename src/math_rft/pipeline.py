@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -14,11 +15,14 @@ from .io_utils import sha256_file, write_json
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def invoke(arguments: list[str], execute: bool) -> None:
+def invoke(arguments: list[str], execute: bool, *, profile: str = "default") -> None:
     command = [sys.executable, "-m", *arguments]
     print(shlex.join(command), flush=True)
     if execute:
-        subprocess.run(command, check=True)
+        if profile == "lowmem":
+            subprocess.run(command, check=True, env={**os.environ, "VLLM_USE_FLASHINFER_SAMPLER": "0"})
+        else:
+            subprocess.run(command, check=True)
 
 
 def code_identity() -> dict[str, str]:
@@ -44,7 +48,8 @@ def frozen_revisions(output: Path, models: dict, selected: list[str]) -> dict[st
 
 
 def evaluation(model: str, data: Path, output: Path, repo: str, n: int, method: str,
-               evaluation_seed: int, training_seed: int | None, revision: str | None, split: str) -> list[str]:
+               evaluation_seed: int, training_seed: int | None, revision: str | None, split: str,
+               profile: str = "default") -> list[str]:
     role = "formal" if split == "math500" else "development"
     args = ["math_rft.evaluate", "--model", model, "--data", str(data / f"{split}.jsonl"),
             "--output", str(output), "--role", role, "--n", str(n),
@@ -53,6 +58,8 @@ def evaluation(model: str, data: Path, output: Path, repo: str, n: int, method: 
         args += ["--training-seed", str(training_seed)]
     if revision:
         args += ["--revision", revision]
+    if profile == "lowmem":
+        args += ["--profile", profile]
     return args
 
 
@@ -60,18 +67,21 @@ def main() -> None:
     matrix = json.loads((ROOT / "configs/experiment.json").read_text(encoding="utf-8"))
     models = json.loads((ROOT / "configs/models.json").read_text(encoding="utf-8"))
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=("default", "lowmem"), default="default",
+                        help="lowmem changes execution memory settings, preserving training and evaluation budgets")
     parser.add_argument("--models", nargs="+", choices=list(models), default=matrix["models"])
     parser.add_argument("--methods", nargs="+", choices=("rft", "grpo"), default=matrix["main_methods"])
     parser.add_argument("--seeds", type=int, nargs="+", default=matrix["training_seeds"])
     parser.add_argument("--stage", choices=("pilot", "full", "deepmath_8192", "deepmath_16384"), default="pilot")
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--output-dir", type=Path, default=Path("runs"))
+    parser.add_argument("--output-dir", type=Path, help="Default: runs; lowmem: runs_lowmem_pipeline")
     parser.add_argument("--evaluation-split", choices=("dev", "math500"), help="Default: dev for pilot; math500 for full/DeepMath")
     parser.add_argument("--n", type=int, help="Samples per question, default 256 for both dev and MATH-500")
     parser.add_argument("--evaluation-seed", type=int, default=matrix["evaluation_seed"])
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     parser.add_argument("--execute", action="store_true", help="Without this flag, print the plan and start no jobs")
     args = parser.parse_args()
+    args.output_dir = args.output_dir or Path("runs_lowmem_pipeline" if args.profile == "lowmem" else "runs")
     args.evaluation_split = args.evaluation_split or ("dev" if args.stage == "pilot" else "math500")
     args.n = args.n if args.n is not None else matrix[
         "formal_samples_per_question" if args.evaluation_split == "math500" else "development_samples_per_question"
@@ -97,7 +107,8 @@ def main() -> None:
         # Keep stage/sample budgets separate so later stages cannot accidentally
         # resume a baseline generated with a different evaluation protocol.
         baseline_output = args.output_dir / "baselines" / args.stage / model / f"{args.evaluation_split}.jsonl"
-        invoke(evaluation(repo, args.data_dir, baseline_output, repo, args.n, "base", args.evaluation_seed, None, revision, args.evaluation_split), args.execute)
+        invoke(evaluation(repo, args.data_dir, baseline_output, repo, args.n, "base", args.evaluation_seed,
+                          None, revision, args.evaluation_split, args.profile), args.execute, profile=args.profile)
         evaluated: dict[str, list[Path]] = {}
         for method in args.methods:
             evaluated[method] = []
@@ -108,6 +119,8 @@ def main() -> None:
                 train_args = ["math_rft.train", "--model", model, "--method", method,
                               "--stage", args.stage, "--seed", str(seed), "--data-dir", str(args.data_dir),
                               "--output-dir", str(args.output_dir)]
+                if args.profile == "lowmem":
+                    train_args += ["--profile", args.profile]
                 if revision:
                     train_args += ["--model-revision", revision]
                 for override in args.overrides:
@@ -116,6 +129,8 @@ def main() -> None:
                     request = {"model": model, "method": method, "stage": args.stage, "seed": seed,
                                "revision": revision, "overrides": args.overrides, "source_hashes": source_hashes,
                                "data_manifest_sha256": sha256_file(args.data_dir / "manifest.json")}
+                    if args.profile == "lowmem":
+                        request["profile"] = args.profile
                     if request_path.exists():
                         if json.loads(request_path.read_text(encoding="utf-8")) != request:
                             raise ValueError(f"Existing trial has a different matrix request: {run_dir}")
@@ -126,14 +141,18 @@ def main() -> None:
                     if not complete_path.exists():
                         # train.py deliberately rejects an incomplete existing run;
                         # finish it explicitly with --resume-from, then rerun matrix.
-                        invoke(train_args, True)
+                        invoke(train_args, True, profile=args.profile)
                     complete = json.loads(complete_path.read_text(encoding="utf-8"))
                     for key in ("model", "method", "stage", "seed"):
                         if complete[key] != request[key]:
                             raise ValueError(f"Completed trial identity mismatch: {key} in {run_dir}")
+                    if complete.get("profile", "default") != args.profile:
+                        raise ValueError(f"Completed trial profile mismatch in {run_dir}")
                     if complete["resolved_config_sha256"] != sha256_file(run_dir / "resolved_config.yaml"):
                         raise ValueError("Completed trial's resolved configuration was modified")
                     prior = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+                    if prior.get("profile", "default") != args.profile:
+                        raise ValueError(f"Training manifest profile mismatch in {run_dir}")
                     if prior["source_sha256"] != complete["source_sha256"]:
                         raise ValueError("Training completion does not match the original source manifest")
                     for dataset_path, digest in prior["data_sha256"].items():
@@ -147,22 +166,23 @@ def main() -> None:
                     if not (exported / "config.json").is_file() or not any(exported.glob("*.safetensors")):
                         raise FileNotFoundError(f"Successful training marker has no exported model: {exported}")
                 else:
-                    invoke(train_args, False)
+                    invoke(train_args, False, profile=args.profile)
                     # Printed symbolic path is informational; execution resolves
                     # it only from a successful training completion marker.
                     exported = run_dir / "checkpoints" / "FINAL_GLOBAL_STEP" / "actor" / "huggingface"
                 eval_output = run_dir / f"{args.evaluation_split}.jsonl"
                 invoke(evaluation(str(exported), args.data_dir, eval_output, repo, args.n, method,
-                                  args.evaluation_seed, seed, None, args.evaluation_split), args.execute)
+                                  args.evaluation_seed, seed, None, args.evaluation_split, args.profile),
+                       args.execute, profile=args.profile)
                 evaluated[method].append(eval_output)
         if "rft" in evaluated and "grpo" in evaluated:
             comparison_dir = args.output_dir / "comparisons" / args.stage / model / "rft_vs_grpo"
             invoke(["math_rft.analyze", "compare", "--left", *map(str, evaluated["rft"]),
                     "--right", *map(str, evaluated["grpo"]), "--output-dir", str(comparison_dir),
-                    "--bootstrap", str(matrix["bootstrap_replicates"])], args.execute)
+                    "--bootstrap", str(matrix["bootstrap_replicates"])], args.execute, profile=args.profile)
             invoke(["math_rft.plot", "--comparison", str(comparison_dir / "comparison.json"),
                     "--baseline", str(baseline_output) + ".summary.json",
-                    "--output-dir", str(comparison_dir / "figures")], args.execute)
+                    "--output-dir", str(comparison_dir / "figures")], args.execute, profile=args.profile)
 
 
 if __name__ == "__main__":

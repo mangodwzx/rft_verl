@@ -11,6 +11,8 @@ from typing import Any
 import torch
 from verl.trainer.ppo.core_algos import agg_loss, register_adv_est, register_policy_loss
 
+from math_rft.entropy_control import install_optional_entropy
+
 
 def _groups(token_level_rewards, response_mask, index):
     if index is None or len(index) != token_level_rewards.shape[0]:
@@ -128,3 +130,7 @@ def _install_qwen35_text_only_patch():
 
 
 _install_qwen35_text_only_patch()
+# external_lib is loaded by the parent, Ray controller and model workers.
+# The controller imports it before constructing its trainer. Entropy-on keeps
+# the upstream behavior; entropy-off removes only the optional statistics.
+install_optional_entropy()

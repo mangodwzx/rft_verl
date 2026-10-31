@@ -1,0 +1,19 @@
+# Execution-only overrides. Keep the full experiment's data, groups, batch,
+# lengths, optimizer, epochs, validation and checkpoint budgets unchanged.
+actor_rollout_ref:
+  actor:
+    calculate_entropy: false
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+  rollout:
+    gpu_memory_utilization: 0.3
+    max_num_seqs: 16
+    max_num_batched_tokens: 2048
+    enable_chunked_prefill: true
+    enforce_eager: true
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      env_vars:
+        VLLM_USE_FLASHINFER_SAMPLER: "0"

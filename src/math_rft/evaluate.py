@@ -193,6 +193,8 @@ def build_summary(rows: list[dict], counts: dict, manifest_hash: str, n: int) ->
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--model", required=True)
+    result.add_argument("--profile", choices=("default", "lowmem"), default="default",
+                        help="lowmem reduces execution memory without changing sample or token budgets")
     result.add_argument("--revision")
     result.add_argument("--data", type=Path, required=True)
     result.add_argument("--output", type=Path, required=True)
@@ -208,16 +210,39 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-tokens", type=int, default=4096)
     result.add_argument("--max-model-len", type=int, default=8192)
     result.add_argument("--max-prompt-tokens", type=int, default=4096)
-    result.add_argument("--batch-size", type=int, default=32)
+    result.add_argument("--batch-size", type=int, help="Requests per generation call: default 32; lowmem 8")
     result.add_argument("--tensor-parallel-size", type=int, default=1)
     result.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="bfloat16")
-    result.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    result.add_argument("--gpu-memory-utilization", type=float, help="vLLM memory fraction: default 0.9; lowmem 0.3")
+    result.add_argument("--max-num-seqs", type=int, help="Concurrent vLLM sequences; lowmem defaults to 16")
+    result.add_argument("--max-num-batched-tokens", type=int, help="vLLM token scheduling budget; lowmem defaults to 2048")
+    result.add_argument("--enable-chunked-prefill", action=argparse.BooleanOptionalAction, default=None)
+    result.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=None)
     result.add_argument("--grader-timeout", type=int, default=5)
     return result
 
 
+def resolve_execution_options(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply execution defaults only; n, seeds, decoding and lengths are untouched."""
+    defaults = {"batch_size": 32, "gpu_memory_utilization": 0.9}
+    if args.profile == "lowmem":
+        defaults.update(batch_size=8, gpu_memory_utilization=0.3,
+                        max_num_seqs=16, max_num_batched_tokens=2048,
+                        enable_chunked_prefill=True, enforce_eager=True)
+    for key, value in defaults.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+    return args
+
+
+def engine_execution_options(args: argparse.Namespace) -> dict:
+    """Pass only explicit/profile options; default retains vLLM's own defaults."""
+    keys = ("max_num_seqs", "max_num_batched_tokens", "enable_chunked_prefill", "enforce_eager")
+    return {key: getattr(args, key) for key in keys if getattr(args, key) is not None}
+
+
 def main(argv: list[str] | None = None) -> None:
-    args = parser().parse_args(argv)
+    args = resolve_execution_options(parser().parse_args(argv))
     if min(args.n, args.max_tokens, args.max_prompt_tokens, args.batch_size,
            args.tensor_parallel_size, args.grader_timeout) < 1:
         raise ValueError("Counts and token budgets must be positive")
@@ -229,6 +254,11 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("Context must accommodate maximum prompt plus response; silent truncation is forbidden")
     if not 0 < args.gpu_memory_utilization < 1:
         raise ValueError("--gpu-memory-utilization must be in (0,1)")
+    if any(value is not None and value < 1 for value in (args.max_num_seqs, args.max_num_batched_tokens)):
+        raise ValueError("Engine concurrency and token scheduling budgets must be positive")
+    if (args.enable_chunked_prefill is False and args.max_num_batched_tokens is not None
+            and args.max_num_batched_tokens < args.max_model_len):
+        raise ValueError("A token scheduling budget smaller than context requires chunked prefill")
     rows = load_data(args.data, args.role, args.n)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     paths = artifact_paths(args.output)
@@ -248,6 +278,9 @@ def main(argv: list[str] | None = None) -> None:
 def run(args: argparse.Namespace, rows: list[dict], paths: dict[str, Path]) -> None:
     # Deliberately lazy: importing or statically checking this package never
     # imports CUDA libraries, downloads models, or starts an inference process.
+    if args.profile == "lowmem":
+        # Must be set before the lazy vLLM import, also for standalone evaluation.
+        os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     from vllm import LLM, SamplingParams
     from math_rft import reward
 
@@ -259,7 +292,9 @@ def run(args: argparse.Namespace, rows: list[dict], paths: dict[str, Path]) -> N
                 "stop": [], "ignore_eos": False, "repetition_penalty": 1.0,
                 "presence_penalty": 0.0, "frequency_penalty": 0.0,
                 "seed_scheme": "sha256_seed_question_id_sample_index_v1", "add_special_tokens": False}
+    execution_options = engine_execution_options(args)
     config = {"schema_version": SCHEMA_VERSION, "model": identity,
+              "execution_profile": args.profile,
               "base_model": args.base_model or (args.model if identity["kind"] == "huggingface" else None),
               "method": args.method, "training_seed": args.training_seed, "role": args.role,
               "dataset_sha256": canonical_hash(rows), "questions": len(rows),
@@ -267,7 +302,9 @@ def run(args: argparse.Namespace, rows: list[dict], paths: dict[str, Path]) -> N
               "engine": {"dtype": args.dtype, "tensor_parallel_size": args.tensor_parallel_size,
                          "max_model_len": args.max_model_len, "max_prompt_tokens": args.max_prompt_tokens,
                          "batch_size": args.batch_size, "gpu_memory_utilization": args.gpu_memory_utilization,
-                         "generation_config": "vllm", "enable_prefix_caching": True},
+                         "generation_config": "vllm", "enable_prefix_caching": True,
+                         "flashinfer_sampler_env": os.environ.get("VLLM_USE_FLASHINFER_SAMPLER"),
+                         **execution_options},
               "grader": {"source_sha256": file_hash(Path(reward.__file__)), "timeout_seconds": args.grader_timeout},
               "evaluator_sha256": file_hash(Path(__file__)), "versions": versions}
     manifest_hash = canonical_hash(config)
@@ -293,7 +330,7 @@ def run(args: argparse.Namespace, rows: list[dict], paths: dict[str, Path]) -> N
               dtype=args.dtype, tensor_parallel_size=args.tensor_parallel_size,
               max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_memory_utilization,
               seed=args.seed, trust_remote_code=False, generation_config="vllm",
-              enable_prefix_caching=True)
+              enable_prefix_caching=True, **execution_options)
     tokenizer = llm.get_tokenizer()
     token_rows = []
     for row in rows:

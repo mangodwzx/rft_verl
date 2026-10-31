@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import json
+import os
 from pathlib import Path
 import shlex
 import sys
@@ -96,6 +98,112 @@ class PipelinePlanTests(unittest.TestCase):
                     self.plan(Path(temporary), *arguments)
                 self.assertEqual(error.exception.code, 2)
                 self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_lowmem_preserves_full_matrix_and_scientific_protocol(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            default = self.plan(root, "--stage", "full")
+            lowmem = self.plan(root, "--profile", "lowmem", "--stage", "full")
+        self.assertEqual(len(default), len(lowmem))
+        for original, adjusted in zip(default, lowmem, strict=True):
+            without_profile = adjusted.copy()
+            if original[0] in {"math_rft.evaluate", "math_rft.train"}:
+                self.assertEqual(option(adjusted, "--profile"), "lowmem")
+                index = without_profile.index("--profile")
+                del without_profile[index:index + 2]
+            self.assertEqual(original, without_profile)
+        training = [command for command in lowmem if command[0] == "math_rft.train"]
+        self.assertEqual(len(training), 24)
+        self.assertEqual({option(command, "--seed") for command in training}, {"42", "43", "44"})
+        self.assertEqual(len({option(command, "--model") for command in training}), 4)
+        evaluations = [command for command in lowmem if command[0] == "math_rft.evaluate"]
+        self.assertEqual(len(evaluations), 28)
+        for command in evaluations:
+            parsed = evaluate.parser().parse_args(command[1:])
+            evaluate.resolve_execution_options(parsed)
+            self.assertEqual((parsed.n, parsed.role, parsed.data.name), (256, "formal", "math500.jsonl"))
+            self.assertEqual((parsed.max_tokens, parsed.max_prompt_tokens, parsed.max_model_len), (4096, 4096, 8192))
+            self.assertEqual((parsed.batch_size, parsed.gpu_memory_utilization), (8, 0.3))
+            self.assertEqual((parsed.max_num_seqs, parsed.max_num_batched_tokens), (16, 2048))
+            self.assertTrue(parsed.enable_chunked_prefill)
+            self.assertTrue(parsed.enforce_eager)
+
+    def test_lowmem_keeps_pilot_sampling_and_does_not_shorten_training(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            commands = self.plan(Path(temporary), "--profile", "lowmem", "--models", "qwen3_1p7b",
+                                 "--seeds", "42", "--set", "trainer.n_gpus_per_node=2")
+        training = [command for command in commands if command[0] == "math_rft.train"]
+        self.assertEqual(len(training), 2)
+        self.assertEqual({option(command, "--method") for command in training}, {"rft", "grpo"})
+        self.assertTrue(all(option(command, "--set") == "trainer.n_gpus_per_node=2" for command in training))
+        evaluations = [command for command in commands if command[0] == "math_rft.evaluate"]
+        self.assertEqual(len(evaluations), 3)
+        self.assertTrue(all(option(command, "--n") == "256" for command in evaluations))
+        self.assertTrue(all(option(command, "--data").endswith("dev.jsonl") for command in evaluations))
+        self.assertTrue(all("--set" not in command for command in evaluations))
+
+    def test_lowmem_still_rejects_insufficient_large_k_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.plan(Path(temporary), "--profile", "lowmem", "--n", "128")
+            commands = self.plan(Path(temporary), "--profile", "lowmem", "--models", "qwen3_1p7b",
+                                 "--seeds", "42", "--n", "512")
+        evaluations = [command for command in commands if command[0] == "math_rft.evaluate"]
+        self.assertTrue(all(option(command, "--n") == "512" for command in evaluations))
+
+    def test_lowmem_output_default_is_separate_and_dry_run_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(sys, "argv", ["pipeline", "--profile", "lowmem"]), \
+                    patch("os.getcwd", return_value=str(root)), \
+                    patch.object(pipeline, "invoke") as invoke, \
+                    patch.object(pipeline, "frozen_revisions") as resolve, redirect_stdout(io.StringIO()):
+                pipeline.main()
+            resolve.assert_not_called()
+            self.assertTrue(all(not call.args[1] for call in invoke.call_args_list))
+            training = [call.args[0] for call in invoke.call_args_list if call.args[0][0] == "math_rft.train"]
+            self.assertTrue(all(Path(option(command, "--output-dir")) == root / "runs_lowmem_pipeline"
+                                for command in training))
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_completed_trial_from_another_profile_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "data"
+            data.mkdir()
+            for name in ("pilot.parquet", "dev.parquet", "dev.jsonl", "manifest.json"):
+                (data / name).write_text("{}", encoding="utf-8")
+            output = root / "runs"
+            run = output / "qwen3_1p7b/rft/pilot/seed_42"
+            run.mkdir(parents=True)
+            (run / "training_complete.json").write_text(json.dumps({
+                "model": "qwen3_1p7b", "method": "rft", "stage": "pilot", "seed": 42,
+            }), encoding="utf-8")
+            argv = ["pipeline", "--profile", "lowmem", "--models", "qwen3_1p7b", "--seeds", "42",
+                    "--methods", "rft", "--execute", "--data-dir", str(data), "--output-dir", str(output)]
+            with patch.object(sys, "argv", argv), patch.object(pipeline, "invoke"), \
+                    patch.object(pipeline, "frozen_revisions", return_value={"qwen3_1p7b": "a" * 40}), \
+                    self.assertRaisesRegex(ValueError, "Completed trial profile mismatch"):
+                pipeline.main()
+            request = json.loads((run / "matrix_request.json").read_text())
+            self.assertEqual(request["profile"], "lowmem")
+
+
+class PipelineEnvironmentTests(unittest.TestCase):
+    def test_lowmem_sampler_workaround_is_confined_to_child_environment(self):
+        with patch.dict(os.environ, {"VLLM_USE_FLASHINFER_SAMPLER": "1"}), \
+                patch.object(pipeline.subprocess, "run") as launch, redirect_stdout(io.StringIO()):
+            pipeline.invoke(["math_rft.evaluate"], True, profile="lowmem")
+            self.assertEqual(launch.call_args.kwargs["env"]["VLLM_USE_FLASHINFER_SAMPLER"], "0")
+            self.assertEqual(os.environ["VLLM_USE_FLASHINFER_SAMPLER"], "1")
+
+    def test_default_environment_and_lowmem_plan_launch_behavior_are_unchanged(self):
+        with patch.object(pipeline.subprocess, "run") as launch, redirect_stdout(io.StringIO()):
+            pipeline.invoke(["math_rft.evaluate"], True)
+            self.assertNotIn("env", launch.call_args.kwargs)
+            launch.reset_mock()
+            pipeline.invoke(["math_rft.evaluate"], False, profile="lowmem")
+            launch.assert_not_called()
 
 
 class EvaluationProtocolTests(unittest.TestCase):

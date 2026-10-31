@@ -18,6 +18,7 @@ METHODS = {
     "grpo": ("grpo", "math_grpo_clip", "seq-mean-token-mean"),
 }
 STAGES = ("pilot", "full", "deepmath_8192", "deepmath_16384")
+PROFILES = ("default", "lowmem")
 
 
 def _sha256(path: Path) -> str:
@@ -83,8 +84,14 @@ def compose_config(args, model_path: str):
         config = compose(config_name="ppo_trainer")
     OmegaConf.set_struct(config, False)
     config = OmegaConf.merge(config, OmegaConf.load(PROJECT_ROOT / "configs/verl_base.yaml"))
+    profile = getattr(args, "profile", "default")
+    if profile not in PROFILES:
+        raise ValueError(f"Unknown training profile: {profile}")
+    if profile != "default":
+        config = OmegaConf.merge(config, OmegaConf.load(PROJECT_ROOT / f"configs/verl_{profile}.yaml"))
     data_dir = Path(args.data_dir).expanduser().resolve()
-    run_dir = Path(args.output_dir).expanduser().resolve() / args.model / args.method / args.stage / f"seed_{args.seed}"
+    output_dir = args.output_dir or ("runs_lowmem" if profile == "lowmem" else "runs")
+    run_dir = Path(output_dir).expanduser().resolve() / args.model / args.method / args.stage / f"seed_{args.seed}"
     advantage, loss, reduction = METHODS[args.method]
     values = {
         "data.train_files": [str(data_dir / f"{args.stage}.parquet")],
@@ -179,33 +186,40 @@ def _validate_config(config, args):
         raise ValueError("Global rollout batch must be divisible by the FSDP world size")
 
 
-def main():
+def parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--method", choices=METHODS, required=True)
     parser.add_argument("--stage", choices=STAGES, default="pilot")
+    parser.add_argument("--profile", choices=PROFILES, default="default",
+                        help="lowmem reduces execution memory while preserving training budgets and objectives")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data-dir", default="data")
-    parser.add_argument("--output-dir", default="runs")
+    parser.add_argument("--output-dir", help="Default: runs; lowmem profile: runs_lowmem")
     parser.add_argument("--model-revision")
     parser.add_argument("--local-model", help="Optional identical starting HF checkpoint for both methods")
     parser.add_argument("--resume-from", help="Exact verl global_step_N checkpoint directory")
     parser.add_argument("--print-config", action="store_true", help="Compose only; no model/data download, Ray, or training")
     parser.add_argument("--set", dest="overrides", action="append", default=[])
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    cli = parser()
+    args = cli.parse_args()
     if args.seed < 0:
-        parser.error("--seed must be nonnegative")
+        cli.error("--seed must be nonnegative")
     upstream = check_verl_revision()
     models = json.loads((PROJECT_ROOT / "configs/models.json").read_text(encoding="utf-8"))
     if args.model not in models:
-        parser.error(f"--model must be one of {', '.join(models)}")
+        cli.error(f"--model must be one of {', '.join(models)}")
     if args.print_config:
         from omegaconf import OmegaConf
         config, _ = compose_config(args, args.local_model or models[args.model]["repo_id"])
         print(OmegaConf.to_yaml(config, resolve=True))
         return
     if sys.platform != "linux":
-        parser.error("Run verl training on Linux with CUDA; this repository can be edited statically on Windows")
+        cli.error("Run verl training on Linux with CUDA; this repository can be edited statically on Windows")
     model_path, model_provenance = _resolve_model(args.model, args.model_revision, args.local_model)
     config, run_dir = compose_config(args, model_path)
     data_paths = [Path(path) for path in [*config.data.train_files, *config.data.val_files]]
@@ -224,6 +238,7 @@ def main():
     manifest = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "model": args.model, "method": args.method, "stage": args.stage, "seed": args.seed,
+        "profile": args.profile,
         "upstream": upstream, "verl_commit": VERL_COMMIT,
         "model_provenance": model_provenance,
         "prompt_sha256": prompt_fingerprint(),
@@ -245,6 +260,8 @@ def main():
         if not manifest_path.is_file():
             raise FileNotFoundError("Resume requires the original run directory and run_manifest.json")
         prior = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if prior.get("profile", "default") != args.profile:
+            raise ValueError("Resume identity mismatch for profile")
         for key in ("model", "method", "stage", "seed", "prompt_sha256", "data_sha256", "model_provenance",
                     "upstream", "environment", "source_sha256"):
             if prior[key] != manifest[key]:
@@ -297,6 +314,7 @@ def main():
         "resolved_config_sha256": _sha256(run_dir / "resolved_config.yaml"),
         "source_sha256": manifest["source_sha256"],
         "model": args.model, "method": args.method, "stage": args.stage, "seed": args.seed,
+        "profile": args.profile,
     }
     temporary = run_dir / "training_complete.json.tmp"
     temporary.write_text(json.dumps(completion, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

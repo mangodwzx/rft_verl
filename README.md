@@ -87,6 +87,76 @@ python -m math_rft.evaluate \
 
 ## 4. 先跑一个模型、一个种子的 pilot
 
+### 保留大 k 实验预算的低显存运行
+
+训练、评测和流水线均支持 `--profile lowmem`。该配置保留训练 batch=64、每题 m=8、3 epochs、
+prompt/response 各 4096 tokens、context=8192、原优化器与验证/保存频率；评测仍默认每题
+**n=256，报告到 pass@256**。它不会缩短成两步训练，也不会减少数据、回答数或回答长度。
+
+低显存模式只改变执行设置：生成显存预算 0.3、最大并发 16、分块 prefill 每批最多 2048 tokens、
+eager 执行、参数/优化器 CPU offload，以及关闭零熵系数下的纯统计熵计算。
+独立评测每次提交 8 条回答，但每题仍完整累计 256 条；同一题/样本编号的种子规则不变。
+较低并发和 CPU 搬运会降低速度，不能保证不同执行设置下结果逐位一致；比较双方应统一设置。
+
+在已安排好 GPU 的终端中运行，例如两卡 Qwen3-1.7B（卡号只是示例，启动前确认资源）：
+
+```bash
+source scripts/activate.sh
+export CUDA_VISIBLE_DEVICES=6,7
+
+# 只查看计划。
+python -m math_rft.pipeline --profile lowmem --stage pilot \
+  --models qwen3_1p7b --seeds 42 --n 256 \
+  --set trainer.n_gpus_per_node=2
+
+# Base 评测 → RFT 训练/评测 → GRPO 训练/评测 → 比较与绘图。
+python -m math_rft.pipeline --profile lowmem --stage pilot \
+  --models qwen3_1p7b --seeds 42 --n 256 \
+  --set trainer.n_gpus_per_node=2 --execute
+```
+
+这仍是 2048 题、每种方法 96 次更新的 pilot，随后在全部 256 道 dev 题上评测。
+结果默认存放在 `runs_lowmem_pipeline/`，与常规 `runs/` 分开。
+使用 `--stage full` 时仍按 full 数据训练并评测完整 MATH-500；模型/种子默认矩阵也不因 lowmem 改变。
+不显式覆盖卡数时，训练仍默认 8 卡。指定两卡只调整 FSDP 资源，保持全局 batch 和更新次数。
+
+也可以分开训练、评测。以下命令不应与上面的完整 pipeline 重复执行：
+
+```bash
+python -m math_rft.train --profile lowmem --model qwen3_1p7b \
+  --method rft --stage pilot --seed 42 \
+  --model-revision ea980cb0a6c2ae4b936e82123acc929f1cec04c1 \
+  --set trainer.n_gpus_per_node=2
+
+python -m math_rft.train --profile lowmem --model qwen3_1p7b \
+  --method grpo --stage pilot --seed 42 \
+  --model-revision ea980cb0a6c2ae4b936e82123acc929f1cec04c1 \
+  --set trainer.n_gpus_per_node=2
+```
+
+单独训练默认输出 `runs_lowmem/`。训练成功后，从完成记录读取导出路径，分别评测：
+
+```bash
+for method in rft grpo; do
+  run_dir="runs_lowmem/qwen3_1p7b/$method/pilot/seed_42"
+  model_path=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["final_hf_model"])' \
+    "$run_dir/training_complete.json") || break
+  python -m math_rft.evaluate --profile lowmem --model "$model_path" \
+    --base-model Qwen/Qwen3-1.7B-Base --method "$method" --training-seed 42 \
+    --data data/dev.jsonl --role development --n 256 \
+    --output "$run_dir/dev.jsonl" || break
+done
+```
+
+lowmem 自动向训练 Ray 环境及独立评测传递 `VLLM_USE_FLASHINFER_SAMPLER=0`，规避本机旧 nvcc
+编译采样内核的问题。项目层熵适配会严格校验固定 verl 方法源码，保持上游 checkout 干净。
+CPU offload 在训练阶段仍需把状态载回 GPU；0.3 是生成引擎预算，不是整个任务显存上限，峰值需实测。
+`--set` 可覆盖训练执行参数；独立评测的 `--batch-size`、`--gpu-memory-utilization`、
+`--max-num-seqs`、`--max-num-batched-tokens` 等显式参数优先于 profile 默认值。
+设置或源码变更后使用新输出目录；恢复训练时保留原 `--profile` 和全部覆盖参数。
+
+### 常规执行设置
+
 先查看计划；没有 `--execute` 就不会下载模型或启动任务：
 
 ```bash
