@@ -14,11 +14,50 @@ from math_rft.prompts import RAW_CHAT_TEMPLATE, prompt_fingerprint
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 METHODS = {
-    "rft": ("math_rft_question", "math_rft_nll", "seq-mean-token-mean"),
-    "grpo": ("grpo", "math_grpo_clip", "seq-mean-token-mean"),
+    "rft": ("math_rft_question", "math_rft_nll", "seq-mean-token-sum-norm"),
+    "grpo": ("grpo", "math_grpo_clip", "seq-mean-token-sum-norm"),
 }
 STAGES = ("pilot", "full", "deepmath_8192", "deepmath_16384")
 PROFILES = ("default", "lowmem")
+BENCHMARKS = ("math", "alfworld")
+LOSS_NORMALIZATIONS = ("fixed", "per_response")
+DEFAULT_LOSS_SCALE = 4096
+
+
+def loss_reduction(normalization: str, scale: int | None) -> tuple[str, int | None]:
+    """Choose a run-wide constant, never a sampled or padded response length."""
+    if normalization == "per_response":
+        if scale is not None:
+            raise ValueError("--loss-scale-factor applies only to --loss-normalization fixed")
+        return "seq-mean-token-mean", None
+    if normalization != "fixed":
+        raise ValueError(f"Unknown loss normalization: {normalization}")
+    scale = DEFAULT_LOSS_SCALE if scale is None else scale
+    if type(scale) is not int or scale <= 0:
+        raise ValueError("--loss-scale-factor must be a positive integer")
+    return "seq-mean-token-sum-norm", scale
+
+
+def default_output_dir(profile: str, normalization: str, *, pipeline: bool = False,
+                       benchmark: str = "math") -> str:
+    if benchmark not in BENCHMARKS:
+        raise ValueError(f"Unknown benchmark: {benchmark}")
+    directory = "runs" + ("_alfworld" if benchmark == "alfworld" else "")
+    if profile == "lowmem":
+        directory += "_lowmem"
+    if normalization == "fixed":
+        directory += "_fixed"
+    if pipeline and profile == "lowmem":
+        directory += "_pipeline"
+    return directory
+
+
+def benchmark_prompt_fingerprint(benchmark: str) -> str:
+    if benchmark == "alfworld":
+        from math_rft.alfworld_episode import prompt_fingerprint as alfworld_prompt_fingerprint
+
+        return alfworld_prompt_fingerprint()
+    return prompt_fingerprint()
 
 
 def _sha256(path: Path) -> str:
@@ -63,14 +102,11 @@ def _resolve_model(model: str, revision: str | None, local_model: str | None):
         # Hash weights too: local checkpoints must not silently change between runs.
         hashes = {str(path.relative_to(model_path)): _sha256(path) for path in files}
         return str(model_path), {"repo_id": repo_id, "local_path": str(model_path), "files_sha256": hashes}
-    from huggingface_hub import HfApi, snapshot_download
+    from math_rft.model_cache import hub_snapshot
 
     if revision is not None and not re.fullmatch(r"[a-fA-F0-9]{40}", revision):
         raise ValueError("--model-revision must be an immutable 40-character commit SHA")
-    resolved = HfApi().model_info(repo_id, revision=revision or "main").sha
-    if not resolved:
-        raise RuntimeError(f"Could not resolve immutable model revision for {repo_id}")
-    model_path = snapshot_download(repo_id, revision=resolved)
+    model_path, resolved = hub_snapshot(repo_id, revision)
     return model_path, {"repo_id": repo_id, "revision": resolved, "snapshot_path": model_path}
 
 
@@ -84,15 +120,24 @@ def compose_config(args, model_path: str):
         config = compose(config_name="ppo_trainer")
     OmegaConf.set_struct(config, False)
     config = OmegaConf.merge(config, OmegaConf.load(PROJECT_ROOT / "configs/verl_base.yaml"))
+    benchmark = getattr(args, "benchmark", "math")
+    if benchmark not in BENCHMARKS:
+        raise ValueError(f"Unknown benchmark: {benchmark}")
+    if benchmark == "alfworld":
+        if args.stage not in ("pilot", "full"):
+            raise ValueError("ALFWorld supports pilot/full stages only")
+        config = OmegaConf.merge(config, OmegaConf.load(PROJECT_ROOT / "configs/verl_alfworld.yaml"))
     profile = getattr(args, "profile", "default")
     if profile not in PROFILES:
         raise ValueError(f"Unknown training profile: {profile}")
     if profile != "default":
         config = OmegaConf.merge(config, OmegaConf.load(PROJECT_ROOT / f"configs/verl_{profile}.yaml"))
-    data_dir = Path(args.data_dir).expanduser().resolve()
-    output_dir = args.output_dir or ("runs_lowmem" if profile == "lowmem" else "runs")
+    data_dir = Path(args.data_dir or ("data_alfworld" if benchmark == "alfworld" else "data")).expanduser().resolve()
+    normalization = args.loss_normalization
+    reduction, scale = loss_reduction(normalization, args.loss_scale_factor)
+    output_dir = args.output_dir or default_output_dir(profile, normalization, benchmark=benchmark)
     run_dir = Path(output_dir).expanduser().resolve() / args.model / args.method / args.stage / f"seed_{args.seed}"
-    advantage, loss, reduction = METHODS[args.method]
+    advantage, loss, _ = METHODS[args.method]
     values = {
         "data.train_files": [str(data_dir / f"{args.stage}.parquet")],
         "data.val_files": [str(data_dir / "dev.parquet")],
@@ -105,14 +150,24 @@ def compose_config(args, model_path: str):
         "actor_rollout_ref.rollout.agent.agent_loop_config_path": str(PROJECT_ROOT / "configs/verl_raw_agent.yaml"),
         "actor_rollout_ref.actor.policy_loss.loss_mode": loss,
         "actor_rollout_ref.actor.loss_agg_mode": reduction,
-        "actor_rollout_ref.actor.loss_scale_factor": None,
+        "actor_rollout_ref.actor.loss_scale_factor": scale,
         "algorithm.adv_estimator": advantage,
-        "trainer.experiment_name": f"{args.model}_{args.method}_{args.stage}_s{args.seed}",
+        "trainer.experiment_name": f"{args.model}_{args.method}_{args.stage}_s{args.seed}" + (
+            f"_fixed_s{scale}" if normalization == "fixed" else ""),
         "trainer.default_local_dir": str(run_dir / "checkpoints"),
         "trainer.rollout_data_dir": str(run_dir / "rollouts"),
         "trainer.validation_data_dir": str(run_dir / "dev_rollouts"),
         "reward.custom_reward_function.path": str(Path(__file__).with_name("reward.py")),
     }
+    if benchmark == "alfworld":
+        values.update({
+            "alfworld.max_steps": args.max_steps,
+            "alfworld.max_action_tokens": args.max_action_tokens,
+            "actor_rollout_ref.rollout.agent.agent_loop_config_path": str(PROJECT_ROOT / "configs/verl_alfworld_agent.yaml"),
+            "reward.custom_reward_function.path": str(Path(__file__).with_name("alfworld_reward.py")),
+            "trainer.project_name": "alfworld_rft",
+        })
+        values["trainer.experiment_name"] = "alfworld_" + values["trainer.experiment_name"]
     for key, value in values.items():
         OmegaConf.update(config, key, value, merge=False)
     for override in args.overrides:
@@ -167,16 +222,35 @@ def _validate_config(config, args):
         raise ValueError("The algorithm module must be imported by every Ray worker")
     if config.actor_rollout_ref.model.custom_chat_template != RAW_CHAT_TEMPLATE:
         raise ValueError("Use the same raw-completion prompt in training and evaluation")
-    if rollout.agent.default_agent_loop != "raw_math":
-        raise ValueError("Use the exact raw token rollout path for Base models")
+    benchmark = getattr(args, "benchmark", "math")
+    expected_loop = "alfworld" if benchmark == "alfworld" else "raw_math"
+    if rollout.agent.default_agent_loop != expected_loop:
+        raise ValueError(f"Use the {expected_loop} rollout path for benchmark {benchmark}")
+    if benchmark == "alfworld":
+        if rollout.full_determinism:
+            raise ValueError("ALFWorld requires full_determinism=false: the pinned worker does not expose per-attempt seeds")
+        if not rollout.multi_turn.enable:
+            raise ValueError("ALFWorld requires multi_turn.enable=true")
+        for name in ("max_steps", "max_action_tokens"):
+            value = config.alfworld[name]
+            if type(value) is not int or value <= 0 or value != getattr(args, name):
+                raise ValueError(f"Set a positive --{name.replace('_', '-')} instead of overriding alfworld.{name}")
+        if config.alfworld.max_action_tokens > config.data.max_response_length:
+            raise ValueError("ALFWorld action budget must fit inside the episode response budget")
+        expected_reward = str(Path(__file__).with_name("alfworld_reward.py"))
+        if config.reward.custom_reward_function.path != expected_reward:
+            raise ValueError("ALFWorld requires environment episode rewards")
     if config.data.filter_overlong_prompts or config.data.truncation != "error":
         raise ValueError("Overlong prompts must fail instead of silently changing the training population")
     correction = config.algorithm.rollout_correction
     if correction.rollout_is is not None or correction.rollout_rs is not None or correction.bypass_mode:
         raise ValueError("Rollout correction changes the objective and must remain disabled")
-    expected = METHODS[args.method]
+    reduction, scale = loss_reduction(args.loss_normalization, args.loss_scale_factor)
+    expected = (*METHODS[args.method][:2], reduction)
     if (config.algorithm.adv_estimator, actor.policy_loss.loss_mode, actor.loss_agg_mode) != expected:
         raise ValueError("Algorithm/loss/reduction must agree with --method; use an explicit method")
+    if actor.loss_scale_factor != scale:
+        raise ValueError("Loss scale must agree with --loss-normalization and --loss-scale-factor")
     if rollout.max_model_len < config.data.max_prompt_length + config.data.max_response_length:
         raise ValueError("rollout.max_model_len must cover prompt + response budgets")
     world_size = config.trainer.nnodes * config.trainer.n_gpus_per_node
@@ -189,13 +263,20 @@ def _validate_config(config, args):
 def parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--benchmark", choices=BENCHMARKS, default="math")
+    parser.add_argument("--max-steps", type=int, default=50, help="ALFWorld actions per episode")
+    parser.add_argument("--max-action-tokens", type=int, default=128, help="ALFWorld generated tokens per action")
     parser.add_argument("--method", choices=METHODS, required=True)
     parser.add_argument("--stage", choices=STAGES, default="pilot")
     parser.add_argument("--profile", choices=PROFILES, default="default",
                         help="lowmem reduces execution memory while preserving training budgets and objectives")
+    parser.add_argument("--loss-normalization", choices=LOSS_NORMALIZATIONS, default="fixed",
+                        help="fixed sums response tokens then divides by a run-wide constant; per_response reproduces the legacy length-biased objective")
+    parser.add_argument("--loss-scale-factor", type=int,
+                        help="Positive constant for fixed normalization (default 4096), shared across both methods")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--data-dir", default="data")
-    parser.add_argument("--output-dir", help="Default: runs; lowmem profile: runs_lowmem")
+    parser.add_argument("--data-dir", help="Default: data for math, data_alfworld for ALFWorld")
+    parser.add_argument("--output-dir", help="Default: runs_fixed / runs_lowmem_fixed; legacy per_response: runs / runs_lowmem")
     parser.add_argument("--model-revision")
     parser.add_argument("--local-model", help="Optional identical starting HF checkpoint for both methods")
     parser.add_argument("--resume-from", help="Exact verl global_step_N checkpoint directory")
@@ -239,15 +320,47 @@ def main():
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "model": args.model, "method": args.method, "stage": args.stage, "seed": args.seed,
         "profile": args.profile,
+        "loss_normalization": args.loss_normalization,
+        "loss_scale_factor": config.actor_rollout_ref.actor.loss_scale_factor,
         "upstream": upstream, "verl_commit": VERL_COMMIT,
         "model_provenance": model_provenance,
-        "prompt_sha256": prompt_fingerprint(),
+        "prompt_sha256": benchmark_prompt_fingerprint(args.benchmark),
         "data_sha256": {str(path): _sha256(path) for path in data_paths},
         "environment": environment_versions(),
         "source_sha256": _source_hashes(),
         "expected_steps": expected_steps,
         "argv": sys.argv,
     }
+    manifest["benchmark"] = args.benchmark
+    if args.benchmark == "alfworld":
+        from math_rft.alfworld_env import environment_identity, validate_task
+
+        dataset_manifest = Path(config.data.train_files[0]).parent / "manifest.json"
+        prepared = json.loads(dataset_manifest.read_text(encoding="utf-8"))
+        if prepared.get("benchmark") != "alfworld":
+            raise ValueError("ALFWorld training requires an ALFWorld dataset manifest")
+        if prepared.get("prompt_sha256") != manifest["prompt_sha256"]:
+            raise ValueError("ALFWorld prepared prompt protocol differs from the current runner")
+        if prepared.get("environment") != environment_identity():
+            raise ValueError("ALFWorld runtime differs from the prepared dataset environment")
+        for path in data_paths:
+            is_training = str(path) in config.data.train_files
+            expected_split = args.stage if is_training else "dev"
+            expected_source = "train" if is_training else "valid_seen"
+            if path.stem != expected_split:
+                raise ValueError(f"ALFWorld requires {expected_split}.parquet here; held-out test tasks cannot train/validate")
+            split = prepared.get("splits", {}).get(path.stem, {})
+            if split.get("parquet_sha256") != _sha256(path):
+                raise ValueError(f"ALFWorld prepared data changed: {path}")
+            for row in pq.read_table(path, columns=["extra_info"]).to_pylist():
+                info = row["extra_info"]
+                task = info["alfworld_task"]
+                if info["split"] != expected_split or task["source_split"] != expected_source:
+                    raise ValueError("ALFWorld training/development row comes from an incorrect source split")
+                validate_task(task)
+        manifest["data_sha256"][str(dataset_manifest)] = _sha256(dataset_manifest)
+        manifest["alfworld"] = {"max_steps": config.alfworld.max_steps,
+                               "max_action_tokens": config.alfworld.max_action_tokens}
     from omegaconf import OmegaConf
     config_text = OmegaConf.to_yaml(config, resolve=True)
     manifest["resolved_config_sha256"] = hashlib.sha256(config_text.encode()).hexdigest()
@@ -260,8 +373,13 @@ def main():
         if not manifest_path.is_file():
             raise FileNotFoundError("Resume requires the original run directory and run_manifest.json")
         prior = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if prior.get("benchmark", "math") != args.benchmark:
+            raise ValueError("Resume identity mismatch for benchmark")
         if prior.get("profile", "default") != args.profile:
             raise ValueError("Resume identity mismatch for profile")
+        if (prior.get("loss_normalization", "per_response") != args.loss_normalization
+                or prior.get("loss_scale_factor") != manifest["loss_scale_factor"]):
+            raise ValueError("Resume identity mismatch for training objective; start a separate run")
         for key in ("model", "method", "stage", "seed", "prompt_sha256", "data_sha256", "model_provenance",
                     "upstream", "environment", "source_sha256"):
             if prior[key] != manifest[key]:
@@ -315,7 +433,12 @@ def main():
         "source_sha256": manifest["source_sha256"],
         "model": args.model, "method": args.method, "stage": args.stage, "seed": args.seed,
         "profile": args.profile,
+        "loss_normalization": args.loss_normalization,
+        "loss_scale_factor": config.actor_rollout_ref.actor.loss_scale_factor,
+        "benchmark": args.benchmark,
     }
+    if args.benchmark == "alfworld":
+        completion["alfworld"] = manifest["alfworld"]
     temporary = run_dir / "training_complete.json.tmp"
     temporary.write_text(json.dumps(completion, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(run_dir / "training_complete.json")

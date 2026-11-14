@@ -1,0 +1,2 @@
+- name: alfworld
+  _target_: math_rft.alfworld_loop.AlfWorldAgentLoop

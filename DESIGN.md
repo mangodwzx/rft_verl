@@ -4,6 +4,18 @@
 
 在同一 Base 模型、训练题池、采样和更新预算下，经过完整多步训练的 RFT 与 GRPO，其 pass@k 差距是否随 k 增大呈现先上升后下降的趋势？报告 k=1、2、4、8、16、32、64、128、256，重点看 pass@128 和 pass@256。
 
+新增 ALFWorld 实验使用同一研究问题与两种目标。通过 `--benchmark alfworld` 选择，
+一条回答对应一条完整环境轨迹；在同一任务初态上分别采样 m 条训练轨迹或 n 条评测轨迹。
+`train` 产生 pilot/full，`valid_seen` 固定为 dev，`valid_unseen` 固定为最终 test。
+记录实际可用任务清单、官方 loader 排除原因、任务文件和环境执行代码哈希，保持测试与训练隔离。
+对每条轨迹求所有模型动作 token 的损失，环境观察及格式 token 不进入损失；
+固定尺度归一化、按任务平均成功轨迹和保留全错组分母等规则继续适用。
+奖励严格取环境 `won` 的 0/1 值，不提供中间奖励、专家动作或隐藏任务状态。
+默认 50 步、单动作 128 token、整条 response 4096 token（含观察）、初始 prompt 4096 token；
+两种方法和独立评测共用 runner、动作边界与终止规则。游戏状态每次重置且关闭对象名随机化，
+评测模型采样由 task/sample/turn 派生种子。模型或环境异常不当作任务失败计数。
+数学实验的默认行为保留；两类 benchmark 使用独立数据、输出、协议身份和统计分组。
+
 定义有符号差值 `Δk = pass@k(RFT) − pass@k(GRPO)`，同时观察绝对差距 `|Δk|`。两者含义不同：负差值继续降低可能代表 RFT 落后更多。实验不预设哪种方法胜出，也不按观察结果删除模型、种子或题目。
 
 ## 模型和阶段
@@ -27,10 +39,10 @@ pilot、full 和 DeepMath 各自从相同冻结 Base revision 开始；full 不�
 
 每批 B 道题，每题由当前策略独立生成 m 条回答。二值奖励为 `r_ij∈{0,1}`，该题成功数 `C_i=Σ_j r_ij`，回答有效 token 长度为 `T_ij`。只用生成回答计算损失，数据集参考答案用于判分。
 
-在线 RFT 的目标是每题成功回答的平均 NLL，再对原始 B 道题平均：
+2026-11-03 的 pilot 诊断发现，原来的逐回答 token 平均在在线正样本模仿中引入长度偏置：即使所有回答都正确，期望更新仍偏向短回答。新的默认协议为 `--loss-normalization fixed`：对完整回答的 token NLL 求和，除以事先固定且与采样无关的常数 S（默认 4096），再按每题成功回答平均、原始 B 道题平均：
 
 ```math
-L_RFT = -1/B Σ_i 1[C_i>0] (1/C_i) Σ_{j:r_ij=1} (1/T_ij) Σ_t log π_θ(y_ijt | x_i,y_ij,<t).
+L_RFT = -1/B Σ_i 1[C_i>0] (1/C_i) Σ_{j:r_ij=1} (1/S) Σ_t log π_θ(y_ijt | x_i,y_ij,<t).
 ```
 
 实现预先在完整 rollout 中计算 `w_ij=m*r_ij/max(C_i,1)`，以原始 B*m 条回答为分母归约。全错题贡献零且保留在分母中；全对题仍学习。成功回答不重新组成较小批次，也不重采样失败题。每次更新后，用新策略继续生成下一批，因此这是在线、多步 RFT。
@@ -46,10 +58,16 @@ A_ij=(r_ij-q_i)/(s_i+1e-6).
 每 token 的新旧策略概率比率为 `ρ_ijt`，使用双边 PPO clipping，`ε=0.2`：
 
 ```math
-L_GRPO = 1/(B*m) Σ_ij (1/T_ij) Σ_t max[-A_ij*ρ_ijt, -A_ij*clip(ρ_ijt,1-ε,1+ε)].
+L_GRPO = 1/(B*m*S) Σ_ij Σ_t max[-A_ij*ρ_ijt, -A_ij*clip(ρ_ijt,1-ε,1+ε)].
 ```
 
-全错、全对组的优势都为零。没有额外 dual clipping。两种方法均逐回答做 token 平均，关闭 KL、熵奖励、reward shaping、成功组过滤和 rollout importance/rejection correction。使用同一最终 boxed-answer 二值判题器；依赖错误或无效参考答案直接报错。
+全错、全对组的优势都为零。没有额外 dual clipping。两种方法使用相同固定 S，关闭 KL、熵奖励、reward shaping、成功组过滤和 rollout importance/rejection correction。该 GRPO 是**固定长度归一化变体**，仍保留组内标准差归一化；不能称为完整的 Dr. GRPO。使用同一最终 boxed-answer 二值判题器；依赖错误或无效参考答案直接报错。
+
+`--loss-normalization per_response` 显式复现原协议，将上述两式的 `1/S` 替换为 `1/T_ij`。原 pilot 权重和结果属于这个旧协议，必须保留，不能重命名为修复后的结果。新旧协议使用不同默认输出目录和 TensorBoard 名称，manifest、completion 和新测评元数据记录归一化方式及 S；已知不同目标或已知/未知目标的训练结果不得直接作为受控配对合并。旧文件不追写元数据。
+
+S 是整个运行的固定正整数，由 `--loss-scale-factor` 设置，默认 4096；它不随实际长度、微批次 padding、batch token 总量或 `--set data.max_response_length=...` 自动变化。改变 S 会改变梯度尺度，需要两种方法对等验证。不能用全 batch token 平均替代固定 S，因为有限采样下随机分母也可能产生长度偏置。
+
+精确枚举验证见 `scripts/diagnose_rft_objective.py`。若两种同样正确的回答长度为 2/8、概率各 0.5，原 RFT 对短分支 logit 的期望损失梯度为 −0.09375（梯度下降偏短），固定 S 后为零。一般地，二值成功概率 q>0 时，固定 S 的期望梯度为 `−[1−(1−q)^m]/(S*q) * ∇q`。这是目标偏置的机制验证；它不能证明真实模型退化只有这一个原因，也不能替代新协议的完整 pilot 重训。
 
 ## 控制训练预算
 

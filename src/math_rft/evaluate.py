@@ -94,14 +94,17 @@ def model_identity(model: str, revision: str | None) -> tuple[str, str | None, d
         hashes = {p.relative_to(local).as_posix(): file_hash(p) for p in files}
         return str(local), None, {"kind": "local", "path": str(local),
                                   "files": hashes, "sha256": canonical_hash(hashes)}
-    from huggingface_hub import HfApi
-    info = HfApi().model_info(repo_id=model, revision=revision)
-    if not info.sha:
-        raise RuntimeError("Could not resolve immutable model revision")
-    return model, info.sha, {"kind": "huggingface", "repo_id": model, "revision": info.sha}
+    from math_rft.model_cache import hub_snapshot
+    path, resolved = hub_snapshot(model, revision)
+    return path, None, {"kind": "huggingface", "repo_id": model, "revision": resolved}
 
 
-def load_data(path: Path, role: str, n: int) -> list[dict]:
+def load_data(path: Path, role: str, n: int, benchmark: str = "math") -> list[dict]:
+    if benchmark == "alfworld":
+        from math_rft.alfworld_evaluate import load_data as load_alfworld_data
+        return load_alfworld_data(path, role, n)
+    if benchmark != "math":
+        raise ValueError(f"Unknown benchmark: {benchmark}")
     rows = list(read_jsonl(path))
     if not rows:
         raise ValueError("Dataset is empty")
@@ -149,6 +152,13 @@ def read_existing(output: Path, rows: list[dict], n: int, seed: int) -> tuple[se
             raise ValueError(f"Non-binary reward: {key}")
         if not isinstance(record.get("response_token_ids"), list):
             raise ValueError(f"Missing response token IDs: {key}")
+        if indexed[question_id].get("data_source") == "alfworld":
+            mask = record.get("response_mask")
+            if (not isinstance(mask, list) or len(mask) != len(record["response_token_ids"])
+                    or any(type(value) is not int or value not in (0, 1) for value in mask)):
+                raise ValueError(f"Missing or invalid ALFWorld actor token mask: {key}")
+            if not isinstance(record.get("turns"), list) or not isinstance(record.get("termination"), str):
+                raise ValueError(f"Missing ALFWorld trajectory: {key}")
         completed.add(key)
         add_count(counts[question_id], record)
     return completed, counts
@@ -157,7 +167,10 @@ def read_existing(output: Path, rows: list[dict], n: int, seed: int) -> tuple[se
 def add_count(count: dict, sample: dict) -> None:
     count["n"] += 1
     count["correct"] += int(sample["score"])
-    count["generated_tokens"] += len(sample["response_token_ids"])
+    count["generated_tokens"] += sum(sample["response_mask"]) if "response_mask" in sample else len(sample["response_token_ids"])
+    if "response_mask" in sample:
+        count["observation_tokens"] = count.get("observation_tokens", 0) + len(sample["response_token_ids"]) - sum(sample["response_mask"])
+        count["environment_steps"] = count.get("environment_steps", 0) + sum("observation" in turn for turn in sample["turns"])
     count["truncated"] += int(sample["finish_reason"] == "length")
     count["grader_statuses"][sample["grader_status"]] += 1
 
@@ -184,6 +197,9 @@ def build_summary(rows: list[dict], counts: dict, manifest_hash: str, n: int) ->
             "generated_tokens": sum(r["generated_tokens"] for r in selected),
             "truncation_rate": sum(r["truncated"] for r in selected) / (len(selected) * n) if selected else None,
         }
+        if any("observation_tokens" in item for item in selected):
+            groups[name]["observation_tokens"] = sum(item.get("observation_tokens", 0) for item in selected)
+            groups[name]["environment_steps"] = sum(item.get("environment_steps", 0) for item in selected)
     return {"schema_version": SCHEMA_VERSION, "manifest_hash": manifest_hash,
             "complete": True, "n": n, "ks": ks, "groups": groups, "questions": per_question,
             "primary_endpoint": "pass@128", "key_secondary_endpoint": "pass@256",
@@ -193,8 +209,9 @@ def build_summary(rows: list[dict], counts: dict, manifest_hash: str, n: int) ->
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--model", required=True)
-    result.add_argument("--profile", choices=("default", "lowmem"), default="default",
-                        help="lowmem reduces execution memory without changing sample or token budgets")
+    result.add_argument("--benchmark", choices=("math", "alfworld"), default="math")
+    result.add_argument("--profile", choices=("default", "lowmem", "throughput"), default="default",
+                        help="Execution defaults only: lowmem saves memory; throughput queues more requests and enables CUDA graphs")
     result.add_argument("--revision")
     result.add_argument("--data", type=Path, required=True)
     result.add_argument("--output", type=Path, required=True)
@@ -202,6 +219,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--n", type=int, default=256)
     result.add_argument("--seed", type=int, default=20261025)
     result.add_argument("--training-seed", type=int)
+    result.add_argument("--training-loss-normalization", choices=("fixed", "per_response"),
+                        help="Training objective provenance; omit for older checkpoints with no recorded objective")
+    result.add_argument("--training-loss-scale-factor", type=int,
+                        help="Positive fixed training loss denominator; required with fixed normalization")
     result.add_argument("--method", default="base")
     result.add_argument("--base-model", help="Original Base model ID; required when comparing trained checkpoints")
     result.add_argument("--temperature", type=float, default=1.0)
@@ -210,15 +231,20 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-tokens", type=int, default=4096)
     result.add_argument("--max-model-len", type=int, default=8192)
     result.add_argument("--max-prompt-tokens", type=int, default=4096)
-    result.add_argument("--batch-size", type=int, help="Requests per generation call: default 32; lowmem 8")
+    result.add_argument("--max-steps", type=int, default=50, help="ALFWorld: maximum environment actions per episode")
+    result.add_argument("--max-action-tokens", type=int, default=128, help="ALFWorld: maximum model tokens per action")
+    result.add_argument("--batch-size", type=int, help="Requests per generation call: default 32; lowmem 8; throughput 256")
     result.add_argument("--tensor-parallel-size", type=int, default=1)
     result.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="bfloat16")
-    result.add_argument("--gpu-memory-utilization", type=float, help="vLLM memory fraction: default 0.9; lowmem 0.3")
-    result.add_argument("--max-num-seqs", type=int, help="Concurrent vLLM sequences; lowmem defaults to 16")
-    result.add_argument("--max-num-batched-tokens", type=int, help="vLLM token scheduling budget; lowmem defaults to 2048")
+    result.add_argument("--gpu-memory-utilization", type=float, help="vLLM memory fraction: default 0.9; lowmem 0.3; throughput 0.6")
+    result.add_argument("--max-num-seqs", type=int, help="Concurrent vLLM sequences: lowmem 16; throughput 64")
+    result.add_argument("--max-num-batched-tokens", type=int, help="vLLM token scheduling budget: lowmem 2048; throughput 8192")
     result.add_argument("--enable-chunked-prefill", action=argparse.BooleanOptionalAction, default=None)
     result.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=None)
     result.add_argument("--grader-timeout", type=int, default=5)
+    result.add_argument("--num-shards", type=int, default=1,
+                        help="Split the full question set across independent evaluators; samples per question are unchanged")
+    result.add_argument("--shard-index", type=int, default=0, help="Zero-based question shard, using rows[index::num_shards]")
     return result
 
 
@@ -229,6 +255,12 @@ def resolve_execution_options(args: argparse.Namespace) -> argparse.Namespace:
         defaults.update(batch_size=8, gpu_memory_utilization=0.3,
                         max_num_seqs=16, max_num_batched_tokens=2048,
                         enable_chunked_prefill=True, enforce_eager=True)
+    elif args.profile == "throughput":
+        # Queue more requests than the active sequence limit so vLLM can refill
+        # slots as short responses finish, before returning the whole batch.
+        defaults.update(batch_size=256, gpu_memory_utilization=0.6,
+                        max_num_seqs=64, max_num_batched_tokens=8192,
+                        enable_chunked_prefill=True, enforce_eager=False)
     for key, value in defaults.items():
         if getattr(args, key) is None:
             setattr(args, key, value)
@@ -241,10 +273,30 @@ def engine_execution_options(args: argparse.Namespace) -> dict:
     return {key: getattr(args, key) for key in keys if getattr(args, key) is not None}
 
 
+def training_objective(method: str, normalization: str | None, scale_factor: int | None) -> dict | None:
+    """Validate optional training provenance without relabeling historical runs."""
+    if normalization is None and scale_factor is None:
+        return None
+    if method not in {"rft", "grpo"}:
+        raise ValueError("Training loss provenance is only valid for trained RFT/GRPO methods")
+    if normalization == "fixed":
+        if type(scale_factor) is not int or scale_factor < 1:
+            raise ValueError("Fixed training loss normalization requires a positive integer scale factor")
+    elif normalization == "per_response":
+        if scale_factor is not None:
+            raise ValueError("Per-response training loss normalization must not specify a scale factor")
+    else:
+        raise ValueError("A training loss scale factor requires an explicit training loss normalization")
+    return {"loss_normalization": normalization, "loss_scale_factor": scale_factor}
+
+
 def main(argv: list[str] | None = None) -> None:
     args = resolve_execution_options(parser().parse_args(argv))
+    args.training_objective = training_objective(
+        args.method, args.training_loss_normalization, args.training_loss_scale_factor,
+    )
     if min(args.n, args.max_tokens, args.max_prompt_tokens, args.batch_size,
-           args.tensor_parallel_size, args.grader_timeout) < 1:
+           args.tensor_parallel_size, args.grader_timeout, args.max_steps, args.max_action_tokens) < 1:
         raise ValueError("Counts and token budgets must be positive")
     if args.seed < 0 or (args.training_seed is not None and args.training_seed < 0):
         raise ValueError("Evaluation and training seeds must be nonnegative")
@@ -259,7 +311,19 @@ def main(argv: list[str] | None = None) -> None:
     if (args.enable_chunked_prefill is False and args.max_num_batched_tokens is not None
             and args.max_num_batched_tokens < args.max_model_len):
         raise ValueError("A token scheduling budget smaller than context requires chunked prefill")
-    rows = load_data(args.data, args.role, args.n)
+    if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("Require num-shards>=1 and 0<=shard-index<num-shards")
+    # Validate the scientific population before partitioning, including all 500
+    # questions for formal evaluation. A shard is never a smaller experiment.
+    rows = load_data(args.data, args.role, args.n, args.benchmark)
+    if args.num_shards > len(rows):
+        raise ValueError("More shards than questions would create an empty shard")
+    args.sharding = None
+    if args.num_shards > 1:
+        args.sharding = {"index": args.shard_index, "count": args.num_shards,
+                         "full_dataset_sha256": canonical_hash(rows),
+                         "full_question_ids": [row["id"] for row in rows]}
+        rows = rows[args.shard_index::args.num_shards]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     paths = artifact_paths(args.output)
     try:
@@ -276,9 +340,13 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def run(args: argparse.Namespace, rows: list[dict], paths: dict[str, Path]) -> None:
+    if getattr(args, "benchmark", "math") == "alfworld":
+        from math_rft.alfworld_evaluate import run as run_alfworld
+        run_alfworld(args, rows, paths)
+        return
     # Deliberately lazy: importing or statically checking this package never
     # imports CUDA libraries, downloads models, or starts an inference process.
-    if args.profile == "lowmem":
+    if args.profile in {"lowmem", "throughput"}:
         # Must be set before the lazy vLLM import, also for standalone evaluation.
         os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
     from vllm import LLM, SamplingParams
@@ -307,6 +375,10 @@ def run(args: argparse.Namespace, rows: list[dict], paths: dict[str, Path]) -> N
                          **execution_options},
               "grader": {"source_sha256": file_hash(Path(reward.__file__)), "timeout_seconds": args.grader_timeout},
               "evaluator_sha256": file_hash(Path(__file__)), "versions": versions}
+    if args.training_objective is not None:
+        config["training_objective"] = args.training_objective
+    if getattr(args, "sharding", None) is not None:
+        config["sharding"] = args.sharding
     manifest_hash = canonical_hash(config)
     if paths["meta"].exists():
         old = json.loads(paths["meta"].read_text(encoding="utf-8"))

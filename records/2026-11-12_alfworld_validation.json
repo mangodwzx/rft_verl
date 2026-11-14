@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "kind": "alfworld_integration_validation_not_model_performance",
+  "checked_at_utc": "2026-11-12T13:48:59.219071+00:00",
+  "git_head": "2b4ce49fc5519347eecd176d93e307b786522e57",
+  "working_tree_has_uncommitted_changes": true,
+  "data_manifest": "data_alfworld/manifest.json",
+  "data_manifest_sha256": "b07baf6eb4bd13f10cd8a466b311aa7543c643c8d4438a9af52a1c1690b4afc9",
+  "splits": {
+    "debug": 32,
+    "dev": 140,
+    "full": 3553,
+    "pilot": 2048,
+    "test": 134
+  },
+  "real_tasks_reset_verified": 3827,
+  "unittest": {
+    "count": 176,
+    "status": "passed"
+  },
+  "static_checks": {
+    "status": "passed",
+    "errors": [],
+    "ruff_output": "All checks passed!\n"
+  },
+  "ingestion": {
+    "pilot_dataloader_rows": 2048,
+    "evaluation_rows": {
+      "dev": 140,
+      "test": 134
+    },
+    "max_prompt_tokens_qwen3_1p7b": {
+      "full": 465,
+      "dev": 461,
+      "test": 297
+    },
+    "environment_matches_manifest": true,
+    "training_batch_size": 64,
+    "rollouts_per_task": 8,
+    "training_agent_loop": "alfworld",
+    "validation": "real parquet, tokenizer, pinned verl dataset and formal population checks; no model weights or GPU loaded"
+  },
+  "real_concurrency_scripted_expert_rounds": [
+    {
+      "round": 0,
+      "episodes": 16,
+      "successes": 16,
+      "native_backends": 16,
+      "idle_backends": 16,
+      "steps": 96,
+      "engine_calls": 96
+    },
+    {
+      "round": 1,
+      "episodes": 16,
+      "successes": 16,
+      "native_backends": 16,
+      "idle_backends": 16,
+      "steps": 96,
+      "engine_calls": 192
+    },
+    {
+      "round": 2,
+      "episodes": 16,
+      "successes": 16,
+      "native_backends": 16,
+      "idle_backends": 16,
+      "steps": 96,
+      "engine_calls": 288
+    }
+  ],
+  "real_sequential_reset_stress": {
+    "attempts": 100,
+    "alternating_tasks": 2,
+    "retained_native_backends": 1,
+    "exit_code": 0
+  },
+  "prepared_debug_runtime": {
+    "step_limit_reports_truncation": true,
+    "official_walkthrough_succeeds": true
+  },
+  "gpu_training_or_model_generation_executed": false,
+  "notes": [
+    "Scripted expert trajectories validate environment integration, not model pass@k.",
+    "GPU training and model-generated trajectories remain to be run on selected GPUs."
+  ]
+}

@@ -34,7 +34,8 @@ def check_verl_revision() -> dict[str, str]:
 
 
 def environment_versions() -> dict[str, str]:
-    packages = ("verl", "torch", "vllm", "transformers", "ray", "datasets", "math-verify", "flash-attn")
+    packages = ("verl", "torch", "vllm", "transformers", "ray", "datasets", "math-verify", "flash-attn",
+                "alfworld", "textworld", "fast-downward-textworld")
     versions = {}
     for package in packages:
         try:

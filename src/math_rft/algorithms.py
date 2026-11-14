@@ -6,6 +6,7 @@ each Ray worker. Never compute success counts again inside a shuffled minibatch.
 from __future__ import annotations
 
 from collections import defaultdict
+import math
 from typing import Any
 
 import torch
@@ -50,9 +51,19 @@ def question_success_weights(token_level_rewards, response_mask, index=None, con
     return weights, weights.clone()
 
 
+def _validate_reduction(loss_agg_mode, config):
+    """Never let a microbatch's padded width become the normalization constant."""
+    if loss_agg_mode == "seq-mean-token-sum-norm":
+        scale = config.global_batch_info.get("loss_scale_factor")
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
+            raise ValueError("Fixed-length normalization requires an explicit positive loss_scale_factor")
+    elif loss_agg_mode != "seq-mean-token-mean":
+        raise ValueError("Use fixed-length normalization or explicit legacy per-response normalization")
+
+
 @register_policy_loss("math_rft_nll")
 def rft_nll(old_log_prob, log_prob, advantages, response_mask,
-            loss_agg_mode="seq-mean-token-mean", config=None,
+            loss_agg_mode="seq-mean-token-sum-norm", config=None,
             rollout_is_weights=None, **kwargs) -> tuple[torch.Tensor, dict[str, Any]]:
     """Actual weighted supervised NLL; no PPO ratio or clipping is used.
 
@@ -64,8 +75,7 @@ def rft_nll(old_log_prob, log_prob, advantages, response_mask,
         raise ValueError("RFT requires verl's original global rollout batch denominator")
     if rollout_is_weights is not None:
         raise ValueError("Rollout IS/rejection correction must be disabled for this RFT definition")
-    if loss_agg_mode != "seq-mean-token-mean":
-        raise ValueError("Main RFT averages tokens per response, then averages the original rollout batch")
+    _validate_reduction(loss_agg_mode, config)
     weights = advantages.detach()
     if torch.any(weights < 0):
         raise ValueError("RFT success weights cannot be negative")
@@ -76,12 +86,13 @@ def rft_nll(old_log_prob, log_prob, advantages, response_mask,
 
 @register_policy_loss("math_grpo_clip")
 def grpo_clip(old_log_prob, log_prob, advantages, response_mask,
-              loss_agg_mode="seq-mean-token-mean", config=None,
+              loss_agg_mode="seq-mean-token-sum-norm", config=None,
               rollout_is_weights=None, **kwargs):
     """Standard two-sided PPO clipped objective, without upstream dual clipping."""
     del kwargs
     if config is None:
         raise ValueError("Actor config is required")
+    _validate_reduction(loss_agg_mode, config)
     if rollout_is_weights is not None:
         raise ValueError("This controlled comparison disables rollout correction")
     low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio

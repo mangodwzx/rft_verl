@@ -2,7 +2,133 @@
 
 本项目只研究一个问题：**经过多步训练后，RFT 与 RL 的 pass@k 差距，是否随 k 增大呈现先上升后下降的趋势？** RL 固定使用 GRPO；对照为 Base、RFT、GRPO。流程是数据准备 → 多步训练 → 同协议采样 → 曲线、差值和统计报告。
 
-当前代码已收敛到该实验，**尚未进行 GPU 训练或真实模型评测，也没有实验结论**。检查记录见 [STATIC_REVIEW.md](STATIC_REVIEW.md)，精确定义见 [DESIGN.md](DESIGN.md)。
+已完成 Qwen3-1.7B、seed42 的旧协议 pilot 训练和 dev 测评。2026-11-03 的诊断发现 RFT 在训练后期严重短答化，并复现了原损失目标的长度偏置；修正后的协议尚需完整重训验证。历史静态检查记录见 [STATIC_REVIEW.md](STATIC_REVIEW.md)，当前精确定义见 [DESIGN.md](DESIGN.md)。
+
+## ALFWorld 多轮训练与 pass@k
+
+新增 `--benchmark alfworld`，使用纯文本环境进行在线 RFT / GRPO 训练和完整 episode 评测。
+默认仍为数学实验。ALFWorld 默认数据目录为 `data_alfworld/`，结果目录为
+`runs_alfworld_fixed/`；低显存流水线为 `runs_alfworld_lowmem_fixed_pipeline/`。
+
+先使用现有训练 Python 安装纯文本依赖，再下载官方任务（不下载视觉模型）：
+
+```bash
+source scripts/activate.sh
+uv pip install --python vendor/verl/.venv/bin/python -e '.[alfworld]'
+python -m math_rft.alfworld_data download --output-dir vendor/alfworld_data
+python -m math_rft.alfworld_data prepare \
+  --data-root vendor/alfworld_data --output-dir data_alfworld --pilot-size 2048 --workers 8
+```
+
+依赖固定为 ALFWorld 0.4.2 / TextWorld 1.7.0。下载器只获取官方 JSON 和 TextWorld 游戏，
+保存来源与校验记录；已有本地数据可直接使用 `prepare --data-root <目录>`。
+数据准备会逐个重置可用任务，记录实际初始观察、文件哈希、环境版本和被过滤任务，
+生成 JSONL、Parquet 和 `manifest.json`。非空目标目录不会覆盖。
+`--workers` 控制独立 CPU 进程数，按可用 CPU 调整；任务排序与划分不随进程数改变。
+
+| 输出 | 官方来源 | 用途 |
+|---|---|---|
+| `pilot` | `train` 按六类任务分层固定取 2048 个 | 首轮训练 |
+| `full` | 全部符合官方 loader 条件的 `train` | 正式训练；包含 pilot |
+| `dev` | `valid_seen` | 调参及训练期间验证 |
+| `test` | `valid_unseen` | 冻结的最终测试集 |
+| `debug` | 最多 32 个固定训练任务 | 环境及模型流程检查 |
+
+实际数量以 manifest 为准；官方发布数量与本地 loader 过滤后的数量可能不同。
+数据目录保存的是任务索引，原始 `vendor/alfworld_data/` 游戏文件也必须保留，
+所有 Ray worker 需要能访问记录的绝对路径。任务或环境版本变化后应重新准备到新目录。
+
+无需 GPU 即可检查环境重置和动作执行：
+
+```bash
+python -m math_rft.alfworld_data smoke \
+  --data data_alfworld/debug.jsonl --actions look inventory
+```
+
+安排好 GPU 后，可以先做少量完整轨迹生成；此命令使用 debug 任务，不训练：
+
+```bash
+python -m math_rft.evaluate --benchmark alfworld --profile lowmem \
+  --model Qwen/Qwen3-1.7B-Base \
+  --revision ea980cb0a6c2ae4b936e82123acc929f1cec04c1 \
+  --data data_alfworld/debug.jsonl --role debug --n 2 \
+  --output runs_alfworld_debug/base.jsonl
+```
+
+沿用同一 Base、两种方法、m=8、固定 S=4096、每批一次更新及 n=256：
+
+```bash
+# 默认仅打印计划；设置 CUDA_VISIBLE_DEVICES 并确认资源后，加 --execute 启动。
+python -m math_rft.pipeline --benchmark alfworld --profile lowmem \
+  --stage pilot --models qwen3_1p7b --seeds 42 \
+  --model-revision ea980cb0a6c2ae4b936e82123acc929f1cec04c1 \
+  --set trainer.n_gpus_per_node=2
+
+# 正式训练从相同 Base 重新开始，并在完整 valid_unseen 上评测。
+python -m math_rft.pipeline --benchmark alfworld --profile lowmem \
+  --stage full --models qwen3_1p7b --seeds 42 43 44 \
+  --model-revision ea980cb0a6c2ae4b936e82123acc929f1cec04c1 \
+  --set trainer.n_gpus_per_node=2
+```
+
+独立训练使用 `python -m math_rft.train --benchmark alfworld ...`，独立正式评测使用
+`python -m math_rft.evaluate --benchmark alfworld --data data_alfworld/test.jsonl --role formal --n 256 ...`。
+`reevaluate` 从训练完成记录识别 benchmark 和交互限制，继续支持 GPU 分片与合并。
+
+ALFWorld 的一条样本是一条从重置到结束的完整轨迹；`k` 表示独立尝试次数。
+每轮模型输出一个动作，以换行或 EOS 结束，环境返回观察后继续生成；不会让模型生成环境反馈。
+默认最多 50 个动作，每个动作最多 128 个 token；`--max-steps`、`--max-action-tokens`
+在流水线中同时传给训练和评测。完整轨迹的 4096 token 上限包含动作和中间观察，
+初始 prompt 上限 4096，总 context 上限 8192。固定 loss 尺度 S 不随实际轨迹长度改变。
+
+只有环境 `won` 为真才奖励 1；未完成任务的轨迹为 0。无法解析成单行动作或预算耗尽会结束轨迹，
+环境/推理异常直接报错。合法格式但环境不接受的命令会返回反馈，模型可以继续尝试。
+RFT 只学习成功轨迹的动作 token；观察和插入的格式 token 的 loss mask 为 0。
+PDDL 原生运行时按进程复用独占后端，每次尝试重新加载并重置任务，不共享游戏状态；
+这样避免上游反复创建动态库造成的资源累积。并发环境仍会占用临时存储，
+请沿用 `source scripts/activate.sh` 将 `TMPDIR` 放在数据盘上。
+评测保留动作、观察、终止原因、actor/observation token 数和每步种子；计算 pass@1 至 pass@256，
+分析按任务类型分组。训练使用引擎的随机采样，禁止会让同组请求复用同一种子的 `full_determinism`；
+这不是逐位可复现承诺。建议先检查 debug/dev 的合法动作率和成功率，小型 Base 若始终失败，
+两种方法的二值奖励都可能没有有效学习信号。
+
+## 2026-11-03：RFT 短答退化诊断与修正
+
+旧协议的 RFT 平均生成长度从训练 step1 的约 362 tokens 降到 step70 的约 10 tokens，最终 dev 测评平均仅 8.35 tokens，99.51% 回答不超过 32 tokens。旧 lowmem 与新 throughput 测评都复现此现象。提示及其 token IDs、基座、训练数据、学习率和采样预算已核对；未发现 EOS/标签错位、损失分母或直接 train/dev 重叠问题。
+
+确定可复现的目标问题位于 `src/math_rft/algorithms.py`：原 RFT 对每条成功回答的 NLL 除以该回答自身长度。即使长、短回答都正确，在线更新的期望梯度仍偏向短回答。新默认 **`--loss-normalization fixed --loss-scale-factor 4096`** 对完整响应求和，再除以固定常数；两种方法使用同一规则。GRPO 仍保留组内标准差归一化，是固定长度归一化变体，不是完整 Dr. GRPO。
+
+这修正了一个已经证明的长度偏置，但不能保证真实模型不会因其他因素退化。旧 step96 权重不会因改代码而恢复，也不能把新目标的 RFT 与旧目标的 GRPO 当成同协议对照。必须从同一 Base 在新目录重训两者，并保留全部旧结果。`--loss-normalization per_response` 可在新运行中显式复现原目标；源码哈希保护仍会阻止用新代码直接续训/续评旧目录。
+
+无需 GPU 的复现和回归检查：
+
+```bash
+python scripts/diagnose_rft_objective.py --verify-registered-loss
+python -m unittest discover -s tests -v
+
+# 从原始记录生成行为统计和PNG/PDF；output-dir 必须为新的空目录。
+python -m math_rft.diagnose \
+  --run-root runs_lowmem_pipeline --eval-root runs_eval_throughput_dualgpu \
+  --baseline runs_lowmem_pipeline/baselines/pilot/qwen3_1p7b/dev.jsonl \
+  --model qwen3_1p7b --stage pilot --seed 42 \
+  --tensorboard-root tensorboard_log/math_rft \
+  --output-dir runs_diagnostics/rft_collapse_check
+```
+
+本次已保存的诊断在 `runs_diagnostics/rft_collapse_20261103/`，包含 `diagnostics.json`、训练/评测 CSV、`figures/training_behavior.png` 和 `figures/evaluation_behavior.png`（另有 PDF）。精确梯度验证在 `objective_gradient_check.json`。
+
+新协议 pilot 计划如下，固定沿用旧实验的 Base revision，避免模型仓库 HEAD 变化混入消融。默认仅打印计划；安排好两张 GPU、设置 `CUDA_VISIBLE_DEVICES` 后加 `--execute` 才启动：
+
+```bash
+python -m math_rft.pipeline --profile lowmem --stage pilot \
+  --models qwen3_1p7b --seeds 42 --n 256 \
+  --model-revision ea980cb0a6c2ae4b936e82123acc929f1cec04c1 \
+  --loss-normalization fixed --loss-scale-factor 4096 \
+  --output-dir runs_lowmem_fixed_pipeline \
+  --set trainer.n_gpus_per_node=2
+```
+
+新运行的 manifest、completion 和测评元数据记录归一化方式与尺度，比较器拒绝混合不同/未知训练目标。训练日志也使用带 `_fixed_s4096` 的独立 TensorBoard 名称。固定尺度的默认输出为 `runs_fixed/`、低显存独立训练为 `runs_lowmem_fixed/`、低显存流水线为 `runs_lowmem_fixed_pipeline/`。
 
 ## 实验设置
 
@@ -20,6 +146,7 @@
 | 训练预算 | 3 epochs，每批 64 题，每题生成 `m=8` 条回答；每批仅更新一次 |
 | 训练种子 | 42、43、44；首轮可只跑 42 |
 | 优化器 | AdamW，lr=1e-6，weight decay=0，梯度裁剪 1.0 |
+| 损失归一化 | 两种方法均对完整回答 token 求和，除以固定 S=4096；旧逐回答平均需显式选择 |
 | 解码 | temperature=1、top-p=1、top-k=-1，仅 EOS 停止 |
 | 长度 | prompt≤4096、response≤4096、context=8192 |
 | 评测采样 | pilot 的 dev 和正式 MATH-500 都默认每题 `n=256` |
@@ -51,6 +178,33 @@ source scripts/activate.sh
 ```
 
 `activate.sh` 同时设置数据盘上的 Python/包/模型缓存和临时目录，并在 535/570 驱动上为本项目的进程加载兼容库。默认运行目录为 `/mnt/public2/wangzixu/rft_runtime`；兼容库位于 `vendor/cuda-compat-13-0/`。它适用于本文的数据中心 GPU 环境，不代表任意显卡/驱动组合都受支持。[NVIDIA 兼容矩阵](https://docs.nvidia.com/deploy/cuda-compatibility/forward-compatibility.html)
+
+### 使用服务器本地模型，不依赖 SSH 1085 代理
+
+Qwen3-1.7B-Base 的固定版本 `ea980cb0a6c2ae4b936e82123acc929f1cec04c1` 已缓存在：
+
+```text
+/mnt/public2/wangzixu/rft_runtime/huggingface/hub/models--Qwen--Qwen3-1.7B-Base/snapshots/ea980cb0a6c2ae4b936e82123acc929f1cec04c1
+```
+
+该缓存约 3.3 GiB，包含权重、配置和分词器，无需重新下载或复制。启动时先选择项目缓存，再开启离线模式：
+
+```bash
+source scripts/activate.sh
+export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+```
+
+训练和 pipeline 命令继续指定 `--model-revision ea980cb0a6c2ae4b936e82123acc929f1cec04c1`；单独以 Hub ID 评测 Base 时对应 `--revision`。程序对固定版本先读取完整本地缓存，向训练/推理引擎传本地路径，同时保留原始 Hub revision 身份。离线模式下缓存缺失会明确报错，不会尝试代理；未固定的 `main` 也不会被静默替换成旧缓存。`reevaluate` 评测已导出模型时直接使用本地目录。
+
+以后需要新模型时，在代理可用的终端中临时关闭离线模式并下载，例如：
+
+```bash
+unset HF_HUB_OFFLINE HF_DATASETS_OFFLINE
+hf download Qwen/Qwen3-1.7B-Base --revision ea980cb0a6c2ae4b936e82123acc929f1cec04c1
+```
+
+下载完成后重新设置离线环境变量即可。缓存 snapshot 内含指向 blobs 的符号链接，应保留缓存目录结构。Hugging Face 的[离线环境变量说明](https://huggingface.co/docs/huggingface_hub/en/package_reference/environment_variables#hfhuboffline)解释了缓存缺失和禁止 HTTP 请求时的行为。
 
 本机已通过真实 CUDA 分配、BF16 反向传播、FlashAttention 前后向、vLLM CuMem sleep/wake 和单 rank NCCL 检查；这不等于已验证模型生成或多卡训练。复查时，先激活上述脚本，再选择自己可用的一张 GPU，例如：
 
@@ -116,7 +270,7 @@ python -m math_rft.pipeline --profile lowmem --stage pilot \
 ```
 
 这仍是 2048 题、每种方法 96 次更新的 pilot，随后在全部 256 道 dev 题上评测。
-结果默认存放在 `runs_lowmem_pipeline/`，与常规 `runs/` 分开。
+结果默认存放在 `runs_lowmem_fixed_pipeline/`，与常规 `runs_fixed/` 和旧协议目录分开。
 使用 `--stage full` 时仍按 full 数据训练并评测完整 MATH-500；模型/种子默认矩阵也不因 lowmem 改变。
 不显式覆盖卡数时，训练仍默认 8 卡。指定两卡只调整 FSDP 资源，保持全局 batch 和更新次数。
 
@@ -134,15 +288,16 @@ python -m math_rft.train --profile lowmem --model qwen3_1p7b \
   --set trainer.n_gpus_per_node=2
 ```
 
-单独训练默认输出 `runs_lowmem/`。训练成功后，从完成记录读取导出路径，分别评测：
+单独训练默认输出 `runs_lowmem_fixed/`。训练成功后，从完成记录读取导出路径，分别评测（以下对应默认 fixed/4096 目标）：
 
 ```bash
 for method in rft grpo; do
-  run_dir="runs_lowmem/qwen3_1p7b/$method/pilot/seed_42"
+  run_dir="runs_lowmem_fixed/qwen3_1p7b/$method/pilot/seed_42"
   model_path=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["final_hf_model"])' \
     "$run_dir/training_complete.json") || break
   python -m math_rft.evaluate --profile lowmem --model "$model_path" \
     --base-model Qwen/Qwen3-1.7B-Base --method "$method" --training-seed 42 \
+    --training-loss-normalization fixed --training-loss-scale-factor 4096 \
     --data data/dev.jsonl --role development --n 256 \
     --output "$run_dir/dev.jsonl" || break
 done
@@ -154,6 +309,71 @@ CPU offload 在训练阶段仍需把状态载回 GPU；0.3 是生成引擎预算
 `--set` 可覆盖训练执行参数；独立评测的 `--batch-size`、`--gpu-memory-utilization`、
 `--max-num-seqs`、`--max-num-batched-tokens` 等显式参数优先于 profile 默认值。
 设置或源码变更后使用新输出目录；恢复训练时保留原 `--profile` 和全部覆盖参数。
+
+### 已训练模型的高吞吐重新评测
+
+独立评测新增 `--profile throughput`，适用于本机 Qwen3-1.7B / A800 80GB：
+每次提交 256 条请求，由 vLLM 最多同时执行 64 条；已结束的请求可以在本次提交内补位。
+该配置启用 CUDA Graph、分块 prefill，调度 token 预算为 8192，显存预算为 0.6，
+并保留 `VLLM_USE_FLASHINFER_SAMPLER=0` 的本机兼容设置。它只改变执行参数，
+仍使用 BF16、每题 n=256、回答上限 4096、上下文 8192 和原采样种子、温度、判分规则。
+训练的 `--profile` 不受此设置影响。
+首次启动会编译和捕获 CUDA Graph；随后每一批请求全部生成、判分并保存后才打印样本进度。
+
+`math_rft.reevaluate` 从已有 `training_complete.json` 读取最终模型，校验训练完成记录后，
+依次重新评测 RFT 和 GRPO，再生成配对比较和 PNG/PDF 图表。它不启动训练，结果写入独立目录：
+
+```bash
+source scripts/activate.sh
+
+# 只校验已有模型并打印计划。
+python -m math_rft.reevaluate \
+  --run-root runs_lowmem_pipeline --output-dir runs_eval_throughput \
+  --model qwen3_1p7b --stage pilot --seed 42 --profile throughput
+
+# 选择已空闲的 GPU；此例使用 GPU 6。RFT 和 GRPO 使用相同的新配置。
+CUDA_VISIBLE_DEVICES=6 python -m math_rft.reevaluate \
+  --run-root runs_lowmem_pipeline --output-dir runs_eval_throughput \
+  --model qwen3_1p7b --stage pilot --seed 42 --profile throughput --execute
+```
+
+评测文件位于 `runs_eval_throughput/qwen3_1p7b/{rft,grpo}/pilot/seed_42/dev.jsonl`，
+比较和图表位于 `runs_eval_throughput/comparisons/pilot/qwen3_1p7b/seed_42/rft_vs_grpo/`。
+`--methods rft` 或 `--methods grpo` 可单独重评一种方法；默认两种都评测。
+完整三条曲线还需按同一配置单独重评 Base；此入口默认只生成 RFT/GRPO 对比。
+
+使用两张卡时，通过 `--gpus` 指定设备编号，每张卡加载独立的模型副本（TP=1），
+按原题目顺序交错分配题目。在 256 题的 dev 集上，GPU 2 和 6 各处理 128 题，
+每题仍完整生成 256 个独立样本。RFT 两个分片全部完成并合并后，再用两张卡评测 GRPO：
+
+```bash
+python -m math_rft.reevaluate \
+  --run-root runs_lowmem_pipeline --output-dir runs_eval_throughput_dualgpu \
+  --model qwen3_1p7b --stage pilot --seed 42 --profile throughput \
+  --gpus 2 6 --n 256 --execute
+```
+
+去掉 `--execute` 可预览每张卡的命令。`--gpus` 会为每个子进程分别设置
+`CUDA_VISIBLE_DEVICES`，覆盖父终端的同名变量；每卡使用相同的 throughput 配置。
+分片保存到各方法目录的 `shards/shard_00000_of_00002/dev.jsonl` 和
+`shards/shard_00001_of_00002/dev.jsonl`，运行日志为对应的 `.jsonl.log`。
+例如查看 GRPO 的两卡进度：
+
+```bash
+tail -f runs_eval_throughput_dualgpu/qwen3_1p7b/grpo/pilot/seed_42/shards/*/dev.jsonl.log
+```
+
+合并前检查题目与样本完整覆盖、原始记录哈希、模型和执行配置一致性，再按原题目顺序
+生成完整 `dev.jsonl` 及其汇总；原始分片保留，合并不会重新生成或判分。
+任一分片失败或主程序收到 Ctrl+C 时，会停止本轮子进程及其推理引擎，跳过后续合并和比较。
+使用相同命令可恢复各分片，完整分片跳过生成；改变分片数量时需要新输出目录。
+
+新旧执行配置可能生成不同的具体答案，因此正式对照建议两种方法统一配置重新评测。
+已有低显存评测的部分结果保留作记录，不混入新配置；不要修改旧 `.meta.json` 绕过校验。
+新评测中断后，使用完全相同的命令、源码和环境重跑可补齐缺失样本，已完成的方法会直接跳过生成。
+`--batch-size`、`--max-num-seqs`、`--gpu-memory-utilization`、`--max-num-batched-tokens`、
+`--enforce-eager` / `--no-enforce-eager` 可覆盖高吞吐默认值，并会同时用于两种方法；
+改动这些参数时应换用新输出目录。此配置不是所有模型的显存保证，其他模型需先检查峰值。
 
 ### 常规执行设置
 
@@ -189,14 +409,14 @@ pilot 和 full **各自从同一个冻结的 Base revision 开始**，full 不�
 python -m math_rft.pipeline --stage full --n 512 --output-dir runs_n512 --execute
 ```
 
-该命令在新目录运行整套实验。如果只想重新评测已有训练终点，使用 `math_rft.evaluate --model <最终HF导出目录> --n 512`，为每个模型指定新的评测输出路径，并保留相同 `--base-model`、`--method`、`--training-seed` 等身份参数，随后重新 compare/plot。原输出路径不允许改变 n 后续跑。
+该命令在新目录运行整套实验。如果只想重新评测已有训练终点，使用 `math_rft.evaluate --model <最终HF导出目录> --n 512`，为每个模型指定新的评测输出路径，并保留相同 `--base-model`、`--method`、`--training-seed` 和已知的 `--training-loss-normalization` / `--training-loss-scale-factor`，随后重新 compare/plot。`reevaluate` 会自动从训练记录透传目标。原输出路径不允许改变 n 后续跑。
 
 ## 查看结果
 
 每个模型的自动报告位于：
 
 ```text
-runs/comparisons/<stage>/<model>/rft_vs_grpo/
+runs_fixed/comparisons/<stage>/<model>/rft_vs_grpo/
   comparison.json          各种子及汇总的配对结果
   per_seed_deltas.csv       各种子的 RFT−GRPO
   aggregate_deltas.csv      跨种子均值、两方法分数和差值区间
@@ -209,22 +429,22 @@ runs/comparisons/<stage>/<model>/rft_vs_grpo/
 
 原始输出位置：
 
-- Base：`runs/baselines/<stage>/<model>/<dev或math500>.jsonl`。
-- 训练与终点评测：`runs/<model>/<rft或grpo>/<stage>/seed_<seed>/`。
+- Base：`runs_fixed/baselines/<stage>/<model>/<dev或math500>.jsonl`。
+- 训练与终点评测：`runs_fixed/<model>/<rft或grpo>/<stage>/seed_<seed>/`（lowmem 流水线根目录为 `runs_lowmem_fixed_pipeline`）。
 - 每个评测 JSONL 旁边都有 `.meta.json`、`.prompts.jsonl` 和 `.summary.json`，保留配置、逐题信息、实际 token IDs、失败与截断记录。
 
 需要单独重做比较或绘图时：
 
 ```bash
 python -m math_rft.analyze compare \
-  --left runs/qwen3_1p7b/rft/full/seed_42/math500.jsonl \
-  --right runs/qwen3_1p7b/grpo/full/seed_42/math500.jsonl \
-  --output-dir runs/manual_comparison
+  --left runs_fixed/qwen3_1p7b/rft/full/seed_42/math500.jsonl \
+  --right runs_fixed/qwen3_1p7b/grpo/full/seed_42/math500.jsonl \
+  --output-dir runs_fixed/manual_comparison
 
 python -m math_rft.plot \
-  --comparison runs/manual_comparison/comparison.json \
-  --baseline runs/baselines/full/qwen3_1p7b/math500.jsonl.summary.json \
-  --output-dir runs/manual_comparison/figures
+  --comparison runs_fixed/manual_comparison/comparison.json \
+  --baseline runs_fixed/baselines/full/qwen3_1p7b/math500.jsonl.summary.json \
+  --output-dir runs_fixed/manual_comparison/figures
 ```
 
 多种子时，`--left` 和 `--right` 各传入多个文件，并按相同种子顺序配对。
@@ -235,10 +455,10 @@ python -m math_rft.plot \
 
 ```bash
 python -m math_rft.train --model qwen3_1p7b --method rft --stage pilot --seed 42 \
-  --resume-from runs/qwen3_1p7b/rft/pilot/seed_42/checkpoints/global_step_40
+  --resume-from runs_fixed/qwen3_1p7b/rft/pilot/seed_42/checkpoints/global_step_40
 ```
 
-恢复时复用原模型 revision 和所有 `--set` 覆盖值；源码、环境和数据也必须一致。上例只适用于实际存在第 40 步检查点的运行。最终完整 HF 导出位于 `checkpoints/global_step_N/actor/huggingface/`，无需再做模型合并。
+恢复时复用原模型 revision、`--loss-normalization`、`--loss-scale-factor` 和所有 `--set` 覆盖值；源码、环境和数据也必须一致。上例只适用于实际存在第 40 步检查点的新协议运行，不能用于将旧协议续训成新协议。最终完整 HF 导出位于 `checkpoints/global_step_N/actor/huggingface/`，无需再做模型合并。
 
 主实验完成后再准备 DeepMath：
 

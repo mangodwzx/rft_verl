@@ -8,7 +8,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from math_rft.analyze import compare, load_run
+from math_rft.analyze import assert_comparable, compare, load_run
 from math_rft.evaluate import artifact_paths, canonical_hash, sample_seed
 from math_rft.metrics import describe_gap_curve, hierarchical_delta_ci, pass_at_k
 from math_rft.plot import comparison_summaries
@@ -46,7 +46,8 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(result["bootstrap_unit"], "paired_training_seed_and_common_question")
 
 
-def ledger(directory: Path, method: str, training_seed: int, correct: tuple[int, int]) -> Path:
+def ledger(directory: Path, method: str, training_seed: int | None, correct: tuple[int, int],
+           training_objective: dict | None = None) -> Path:
     n, evaluation_seed = 256, 19
     path = directory / f"{method}_{training_seed}.jsonl"
     rows = [{"id": f"q{index}", "subject": "algebra", "level": level} for index, level in enumerate((2, 5))]
@@ -54,6 +55,8 @@ def ledger(directory: Path, method: str, training_seed: int, correct: tuple[int,
               "sampling": {"n": n, "seed": evaluation_seed}, "grader": "synthetic", "role": "development",
               "versions": {}, "base_model": "synthetic/base", "method": method, "training_seed": training_seed,
               "engine": {"dtype": "bfloat16", "max_model_len": 64, "max_prompt_tokens": 16, "generation_config": {}}}
+    if training_objective is not None:
+        config["training_objective"] = training_objective
     paths = artifact_paths(path)
     paths["meta"].write_text(json.dumps({"config": config, "manifest_hash": canonical_hash(config)}), encoding="utf-8")
     paths["prompts"].write_text("".join(json.dumps({**row, "prompt_token_ids": [1]}) + "\n" for row in rows), encoding="utf-8")
@@ -68,6 +71,37 @@ def ledger(directory: Path, method: str, training_seed: int, correct: tuple[int,
 
 
 class AnalysisIntegrationTests(unittest.TestCase):
+    def test_training_objective_mismatch_rejected_but_base_comparison_allowed(self):
+        fixed = {"loss_normalization": "fixed", "loss_scale_factor": 4096}
+        for other in (None, {"loss_normalization": "per_response", "loss_scale_factor": None},
+                      {"loss_normalization": "fixed", "loss_scale_factor": 2048}):
+            with self.subTest(other=other), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                left = load_run(ledger(root, "rft", 42, (1, 1), fixed))
+                right = load_run(ledger(root, "grpo", 42, (1, 1), other))
+                with self.assertRaisesRegex(ValueError, "training_objective"):
+                    assert_comparable(left, right)
+                base = load_run(ledger(root, "base", None, (1, 1)))
+                assert_comparable(left, base)
+                assert_comparable(base, left)
+
+    def test_objective_is_preserved_in_report_and_consistent_across_seeds(self):
+        fixed = {"loss_normalization": "fixed", "loss_scale_factor": 4096}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            left = [ledger(root, "rft", 42, (1, 1), fixed)]
+            right = [ledger(root, "grpo", 42, (1, 1), fixed)]
+            args = argparse.Namespace(left=left, right=right, output_dir=root / "analysis", bootstrap=100, seed=7)
+            compare(args)
+            report = json.loads((args.output_dir / "comparison.json").read_text())
+            self.assertEqual(report["training_objectives"], {"left": fixed, "right": fixed})
+            left.append(ledger(root, "rft", 43, (1, 1)))
+            right.append(ledger(root, "grpo", 43, (1, 1)))
+            args.output_dir = root / "mixed"
+            with self.assertRaisesRegex(ValueError, "Cross-seed.*training_objective"):
+                compare(args)
+            self.assertFalse(args.output_dir.exists())
+
     def test_two_seed_complete_ledgers_produce_trends_and_mean_curves(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

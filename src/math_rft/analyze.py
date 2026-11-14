@@ -99,6 +99,12 @@ def summarize(args: argparse.Namespace) -> None:
 
 def assert_comparable(left: dict, right: dict) -> None:
     lc, rc = left["config"], right["config"]
+    for key, default in (("benchmark", "math"), ("episode_protocol", None)):
+        if lc.get(key, default) != rc.get(key, default):
+            raise ValueError(f"Cannot compare runs with different {key}")
+    if (lc["method"] != "base" and rc["method"] != "base"
+            and lc.get("training_objective") != rc.get("training_objective")):
+        raise ValueError("Cannot compare trained runs with different or unknown training_objective provenance")
     for key in ("dataset_sha256", "question_ids", "sampling", "grader", "role", "versions"):
         if lc[key] != rc[key]:
             raise ValueError(f"Cannot compare runs with different {key}: {left['path']} vs {right['path']}")
@@ -166,6 +172,11 @@ def compare(args: argparse.Namespace) -> None:
     for left, right in pairs:
         assert_comparable(left, right)
         for candidate, reference in ((left, reference_left), (right, reference_right)):
+            for key, default in (("benchmark", "math"), ("episode_protocol", None)):
+                if candidate["config"].get(key, default) != reference["config"].get(key, default):
+                    raise ValueError(f"Cross-seed series has inconsistent {key}")
+            if candidate["config"].get("training_objective") != reference["config"].get("training_objective"):
+                raise ValueError("Cross-seed series has inconsistent training_objective")
             for key in ("base_model", "method", "dataset_sha256", "question_ids", "sampling", "grader", "role", "versions", "engine"):
                 if candidate["config"][key] != reference["config"][key]:
                     raise ValueError(f"Cross-seed series has inconsistent {key}")
@@ -233,6 +244,7 @@ def compare(args: argparse.Namespace) -> None:
                                    "seed_std": estimate["seed_std"],
                                    "ci95_low": estimate["ci95"][0], "ci95_high": estimate["ci95"][1]})
     output = {"direction": "left_minus_right", "base_model": reference_left["config"]["base_model"],
+              "benchmark": reference_left["config"].get("benchmark", "math"),
               "dataset_sha256": reference_left["config"]["dataset_sha256"],
               "question_ids": reference_left["config"]["question_ids"],
               "left_method": reference_left["config"]["method"], "right_method": reference_right["config"]["method"],
@@ -245,6 +257,10 @@ def compare(args: argparse.Namespace) -> None:
                   "At n=k, pass@k is observed coverage; larger n gives a finer per-question estimate at the same k.",
                   "With only a few training seeds, seed uncertainty remains poorly estimated; report each seed.",
               ]}
+    objectives = {"left": reference_left["config"].get("training_objective"),
+                  "right": reference_right["config"].get("training_objective")}
+    if any(value is not None for value in objectives.values()):
+        output["training_objectives"] = objectives
     trends = gap_trends(pairs, group_ids, n, args.bootstrap, args.seed)
     output["trends"] = trends
     atomic_json(args.output_dir / "comparison.json", output)

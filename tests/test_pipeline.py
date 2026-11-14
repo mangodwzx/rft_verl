@@ -162,9 +162,70 @@ class PipelinePlanTests(unittest.TestCase):
             resolve.assert_not_called()
             self.assertTrue(all(not call.args[1] for call in invoke.call_args_list))
             training = [call.args[0] for call in invoke.call_args_list if call.args[0][0] == "math_rft.train"]
-            self.assertTrue(all(Path(option(command, "--output-dir")) == root / "runs_lowmem_pipeline"
+            self.assertTrue(all(Path(option(command, "--output-dir")) == root / "runs_lowmem_fixed_pipeline"
                                 for command in training))
             self.assertEqual(list(root.iterdir()), [])
+
+    def test_fixed_objective_is_shared_and_recorded_in_trained_evaluations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            commands = self.plan(Path(temporary), "--models", "qwen3_1p7b", "--seeds", "42",
+                                 "--loss-scale-factor", "2048")
+        for command in commands:
+            if command[0] == "math_rft.train":
+                self.assertEqual(option(command, "--loss-normalization"), "fixed")
+                self.assertEqual(option(command, "--loss-scale-factor"), "2048")
+            elif command[0] == "math_rft.evaluate":
+                if option(command, "--method") == "base":
+                    self.assertNotIn("--training-loss-normalization", command)
+                else:
+                    self.assertEqual(option(command, "--training-loss-normalization"), "fixed")
+                    self.assertEqual(option(command, "--training-loss-scale-factor"), "2048")
+
+    def test_legacy_normalization_is_explicit_without_fixed_scale(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            commands = self.plan(Path(temporary), "--models", "qwen3_1p7b", "--seeds", "42",
+                                 "--loss-normalization", "per_response")
+        for command in commands:
+            if command[0] == "math_rft.train":
+                self.assertEqual(option(command, "--loss-normalization"), "per_response")
+                self.assertNotIn("--loss-scale-factor", command)
+            elif command[0] == "math_rft.evaluate" and option(command, "--method") != "base":
+                self.assertEqual(option(command, "--training-loss-normalization"), "per_response")
+                self.assertNotIn("--training-loss-scale-factor", command)
+
+    def test_repeat_pilot_pins_base_and_both_trainings_to_same_revision(self):
+        revision = "a" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            commands = self.plan(Path(temporary), "--models", "qwen3_1p7b", "--seeds", "42",
+                                 "--model-revision", revision)
+        for command in commands:
+            if command[0] == "math_rft.train":
+                self.assertEqual(option(command, "--model-revision"), revision)
+            elif command[0] == "math_rft.evaluate" and option(command, "--method") == "base":
+                self.assertEqual(option(command, "--revision"), revision)
+        for args in (("--model-revision", revision),
+                     ("--models", "qwen3_1p7b", "--model-revision", "main")):
+            with tempfile.TemporaryDirectory() as temporary, redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.plan(Path(temporary), *args)
+
+    def test_completed_legacy_trial_cannot_be_reused_for_fixed_objective(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "data"
+            data.mkdir()
+            for name in ("pilot.parquet", "dev.parquet", "dev.jsonl", "manifest.json"):
+                (data / name).write_text("{}", encoding="utf-8")
+            run = root / "runs/qwen3_1p7b/rft/pilot/seed_42"
+            run.mkdir(parents=True)
+            (run / "training_complete.json").write_text(json.dumps({
+                "model": "qwen3_1p7b", "method": "rft", "stage": "pilot", "seed": 42,
+            }), encoding="utf-8")
+            argv = ["pipeline", "--models", "qwen3_1p7b", "--seeds", "42", "--methods", "rft",
+                    "--execute", "--data-dir", str(data), "--output-dir", str(root / "runs")]
+            with patch.object(sys, "argv", argv), patch.object(pipeline, "invoke"), \
+                    patch.object(pipeline, "frozen_revisions", return_value={"qwen3_1p7b": "a" * 40}), \
+                    self.assertRaisesRegex(ValueError, "training objective mismatch"):
+                pipeline.main()
 
     def test_completed_trial_from_another_profile_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

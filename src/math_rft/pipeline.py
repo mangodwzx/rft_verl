@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from .io_utils import sha256_file, write_json
+from .train import BENCHMARKS, LOSS_NORMALIZATIONS, default_output_dir, loss_reduction
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -30,36 +31,49 @@ def code_identity() -> dict[str, str]:
     return {path.relative_to(ROOT).as_posix(): sha256_file(path) for path in paths if path.is_file()}
 
 
-def frozen_revisions(output: Path, models: dict, selected: list[str]) -> dict[str, str]:
+def frozen_revisions(output: Path, models: dict, selected: list[str], revision: str | None = None) -> dict[str, str]:
     """Resolve HF revisions once for the whole matrix, before any trial starts."""
-    from huggingface_hub import HfApi
+    from .model_cache import hub_revision
 
     path = output / "model_revisions.json"
     revisions = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    if revision is not None and (len(selected) != 1 or not re.fullmatch(r"[a-fA-F0-9]{40}", revision)):
+        raise ValueError("An explicit --model-revision requires exactly one model and an immutable 40-character SHA")
     for model in selected:
         repo = models[model]["repo_id"]
         if model not in revisions:
-            sha = HfApi().model_info(repo).sha
+            sha = hub_revision(repo, revision)
             revisions[model] = {"repo_id": repo, "revision": sha}
         if revisions[model]["repo_id"] != repo or not re.fullmatch(r"[a-fA-F0-9]{40}", str(revisions[model]["revision"])):
             raise ValueError(f"Invalid frozen model revision for {model}")
+        if revision is not None and revisions[model]["revision"].lower() != revision.lower():
+            raise ValueError(f"Requested revision differs from the already frozen revision for {model}")
     write_json(path, revisions)
     return {model: revisions[model]["revision"] for model in selected}
 
 
 def evaluation(model: str, data: Path, output: Path, repo: str, n: int, method: str,
                evaluation_seed: int, training_seed: int | None, revision: str | None, split: str,
-               profile: str = "default") -> list[str]:
-    role = "formal" if split == "math500" else "development"
+               profile: str = "default", loss_normalization: str | None = None,
+               loss_scale_factor: int | None = None, benchmark: str = "math",
+               max_steps: int = 50, max_action_tokens: int = 128) -> list[str]:
+    role = "formal" if split in ("math500", "test") else "development"
     args = ["math_rft.evaluate", "--model", model, "--data", str(data / f"{split}.jsonl"),
             "--output", str(output), "--role", role, "--n", str(n),
             "--seed", str(evaluation_seed), "--method", method, "--base-model", repo]
+    if benchmark == "alfworld":
+        args += ["--benchmark", benchmark, "--max-steps", str(max_steps),
+                 "--max-action-tokens", str(max_action_tokens)]
     if training_seed is not None:
         args += ["--training-seed", str(training_seed)]
     if revision:
         args += ["--revision", revision]
     if profile == "lowmem":
         args += ["--profile", profile]
+    if loss_normalization is not None:
+        args += ["--training-loss-normalization", loss_normalization]
+        if loss_scale_factor is not None:
+            args += ["--training-loss-scale-factor", str(loss_scale_factor)]
     return args
 
 
@@ -67,38 +81,73 @@ def main() -> None:
     matrix = json.loads((ROOT / "configs/experiment.json").read_text(encoding="utf-8"))
     models = json.loads((ROOT / "configs/models.json").read_text(encoding="utf-8"))
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--benchmark", choices=BENCHMARKS, default="math")
+    parser.add_argument("--max-steps", type=int, default=50, help="ALFWorld actions per episode, train and eval")
+    parser.add_argument("--max-action-tokens", type=int, default=128, help="ALFWorld tokens per action, train and eval")
     parser.add_argument("--profile", choices=("default", "lowmem"), default="default",
                         help="lowmem changes execution memory settings, preserving training and evaluation budgets")
+    parser.add_argument("--loss-normalization", choices=LOSS_NORMALIZATIONS, default="fixed",
+                        help="Shared RFT/GRPO normalization: fixed constant (default) or legacy per_response")
+    parser.add_argument("--loss-scale-factor", type=int, help="Shared fixed loss scale, default 4096")
     parser.add_argument("--models", nargs="+", choices=list(models), default=matrix["models"])
+    parser.add_argument("--model-revision", help="Pin one selected model to an immutable SHA, e.g. when repeating a pilot")
     parser.add_argument("--methods", nargs="+", choices=("rft", "grpo"), default=matrix["main_methods"])
     parser.add_argument("--seeds", type=int, nargs="+", default=matrix["training_seeds"])
     parser.add_argument("--stage", choices=("pilot", "full", "deepmath_8192", "deepmath_16384"), default="pilot")
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--output-dir", type=Path, help="Default: runs; lowmem: runs_lowmem_pipeline")
-    parser.add_argument("--evaluation-split", choices=("dev", "math500"), help="Default: dev for pilot; math500 for full/DeepMath")
+    parser.add_argument("--data-dir", type=Path, help="Default: data or data_alfworld according to benchmark")
+    parser.add_argument("--output-dir", type=Path, help="Default: runs_fixed; lowmem: runs_lowmem_fixed_pipeline; per_response retains legacy defaults")
+    parser.add_argument("--evaluation-split", choices=("dev", "math500", "test"),
+                        help="Default: dev for pilot; math500 (math) or test (ALFWorld) for full")
     parser.add_argument("--n", type=int, help="Samples per question, default 256 for both dev and MATH-500")
     parser.add_argument("--evaluation-seed", type=int, default=matrix["evaluation_seed"])
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     parser.add_argument("--execute", action="store_true", help="Without this flag, print the plan and start no jobs")
     args = parser.parse_args()
-    args.output_dir = args.output_dir or Path("runs_lowmem_pipeline" if args.profile == "lowmem" else "runs")
-    args.evaluation_split = args.evaluation_split or ("dev" if args.stage == "pilot" else "math500")
+    try:
+        _, loss_scale = loss_reduction(args.loss_normalization, args.loss_scale_factor)
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.output_dir = args.output_dir or Path(default_output_dir(
+        args.profile, args.loss_normalization, pipeline=True, benchmark=args.benchmark))
+    args.data_dir = args.data_dir or Path("data_alfworld" if args.benchmark == "alfworld" else "data")
+    formal_split = "test" if args.benchmark == "alfworld" else "math500"
+    args.evaluation_split = args.evaluation_split or ("dev" if args.stage == "pilot" else formal_split)
+    if args.evaluation_split not in ("dev", formal_split):
+        parser.error(f"Benchmark {args.benchmark} requires dev or {formal_split} evaluation")
+    if args.benchmark == "alfworld":
+        if args.stage not in ("pilot", "full") or min(args.max_steps, args.max_action_tokens) <= 0:
+            parser.error("ALFWorld requires pilot/full and positive episode/action budgets")
+        # These overrides would silently change training while evaluation kept
+        # a different trajectory budget. Standalone train/evaluate allow explicit budgets.
+        for override in args.overrides:
+            if override.split("=", 1)[0] in {
+                "data.max_prompt_length", "data.max_response_length", "actor_rollout_ref.rollout.max_model_len",
+                "alfworld.max_steps", "alfworld.max_action_tokens",
+            }:
+                parser.error("Use --max-steps/--max-action-tokens for shared ALFWorld limits; "
+                             "custom context budgets require matched standalone train/evaluate commands")
     args.n = args.n if args.n is not None else matrix[
-        "formal_samples_per_question" if args.evaluation_split == "math500" else "development_samples_per_question"
+        "formal_samples_per_question" if args.evaluation_split == formal_split else "development_samples_per_question"
     ]
     minimum_n = matrix["max_k"]
     if args.n < minimum_n or not args.seeds or min(args.seeds) < 0 or len(set(args.seeds)) != len(args.seeds):
         parser.error("This experiment requires n>=256 and distinct nonnegative training seeds; use evaluate --role debug for a smoke test")
     if len(set(args.models)) != len(args.models) or len(set(args.methods)) != len(args.methods):
         parser.error("Duplicate models or methods are not allowed")
+    if args.model_revision is not None and (len(args.models) != 1 or not re.fullmatch(r"[a-fA-F0-9]{40}", args.model_revision)):
+        parser.error("--model-revision requires exactly one --models entry and a 40-character commit SHA")
     args.output_dir = args.output_dir.resolve()
     args.data_dir = args.data_dir.resolve()
-    revisions = {}
+    revisions = {args.models[0]: args.model_revision} if args.model_revision else {}
     if args.execute:
         for filename in (f"{args.stage}.parquet", "dev.parquet", f"{args.evaluation_split}.jsonl", "manifest.json"):
             if not (args.data_dir / filename).is_file():
                 raise FileNotFoundError(f"Prepare the data before running the matrix: {filename}")
-        revisions = frozen_revisions(args.output_dir, models, args.models)
+        prepared = json.loads((args.data_dir / "manifest.json").read_text(encoding="utf-8"))
+        if prepared.get("benchmark", "math") != args.benchmark:
+            raise ValueError("Prepared data benchmark does not match --benchmark")
+        revisions = (frozen_revisions(args.output_dir, models, args.models, revision=args.model_revision)
+                     if args.model_revision else frozen_revisions(args.output_dir, models, args.models))
     else:
         print("PLAN ONLY. --execute freezes model revisions, then launches these jobs. No data/models are loaded.")
     source_hashes = code_identity()
@@ -108,7 +157,9 @@ def main() -> None:
         # resume a baseline generated with a different evaluation protocol.
         baseline_output = args.output_dir / "baselines" / args.stage / model / f"{args.evaluation_split}.jsonl"
         invoke(evaluation(repo, args.data_dir, baseline_output, repo, args.n, "base", args.evaluation_seed,
-                          None, revision, args.evaluation_split, args.profile), args.execute, profile=args.profile)
+                          None, revision, args.evaluation_split, args.profile, benchmark=args.benchmark,
+                          max_steps=args.max_steps, max_action_tokens=args.max_action_tokens),
+               args.execute, profile=args.profile)
         evaluated: dict[str, list[Path]] = {}
         for method in args.methods:
             evaluated[method] = []
@@ -118,7 +169,13 @@ def main() -> None:
                 request_path = run_dir / "matrix_request.json"
                 train_args = ["math_rft.train", "--model", model, "--method", method,
                               "--stage", args.stage, "--seed", str(seed), "--data-dir", str(args.data_dir),
-                              "--output-dir", str(args.output_dir)]
+                              "--output-dir", str(args.output_dir),
+                              "--loss-normalization", args.loss_normalization]
+                if args.benchmark == "alfworld":
+                    train_args += ["--benchmark", args.benchmark, "--max-steps", str(args.max_steps),
+                                   "--max-action-tokens", str(args.max_action_tokens)]
+                if loss_scale is not None:
+                    train_args += ["--loss-scale-factor", str(loss_scale)]
                 if args.profile == "lowmem":
                     train_args += ["--profile", args.profile]
                 if revision:
@@ -128,7 +185,11 @@ def main() -> None:
                 if args.execute:
                     request = {"model": model, "method": method, "stage": args.stage, "seed": seed,
                                "revision": revision, "overrides": args.overrides, "source_hashes": source_hashes,
+                               "loss_normalization": args.loss_normalization, "loss_scale_factor": loss_scale,
                                "data_manifest_sha256": sha256_file(args.data_dir / "manifest.json")}
+                    if args.benchmark == "alfworld":
+                        request.update(benchmark=args.benchmark, max_steps=args.max_steps,
+                                       max_action_tokens=args.max_action_tokens)
                     if args.profile == "lowmem":
                         request["profile"] = args.profile
                     if request_path.exists():
@@ -143,16 +204,26 @@ def main() -> None:
                         # finish it explicitly with --resume-from, then rerun matrix.
                         invoke(train_args, True, profile=args.profile)
                     complete = json.loads(complete_path.read_text(encoding="utf-8"))
+                    if complete.get("benchmark", "math") != args.benchmark:
+                        raise ValueError(f"Completed trial benchmark mismatch in {run_dir}")
                     for key in ("model", "method", "stage", "seed"):
                         if complete[key] != request[key]:
                             raise ValueError(f"Completed trial identity mismatch: {key} in {run_dir}")
                     if complete.get("profile", "default") != args.profile:
                         raise ValueError(f"Completed trial profile mismatch in {run_dir}")
+                    if (complete.get("loss_normalization", "per_response") != args.loss_normalization
+                            or complete.get("loss_scale_factor") != loss_scale):
+                        raise ValueError(f"Completed trial training objective mismatch in {run_dir}; use a separate output directory")
                     if complete["resolved_config_sha256"] != sha256_file(run_dir / "resolved_config.yaml"):
                         raise ValueError("Completed trial's resolved configuration was modified")
                     prior = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+                    if prior.get("benchmark", "math") != args.benchmark:
+                        raise ValueError(f"Training manifest benchmark mismatch in {run_dir}")
                     if prior.get("profile", "default") != args.profile:
                         raise ValueError(f"Training manifest profile mismatch in {run_dir}")
+                    if (prior.get("loss_normalization", "per_response") != args.loss_normalization
+                            or prior.get("loss_scale_factor") != loss_scale):
+                        raise ValueError(f"Training manifest objective mismatch in {run_dir}")
                     if prior["source_sha256"] != complete["source_sha256"]:
                         raise ValueError("Training completion does not match the original source manifest")
                     for dataset_path, digest in prior["data_sha256"].items():
@@ -172,7 +243,9 @@ def main() -> None:
                     exported = run_dir / "checkpoints" / "FINAL_GLOBAL_STEP" / "actor" / "huggingface"
                 eval_output = run_dir / f"{args.evaluation_split}.jsonl"
                 invoke(evaluation(str(exported), args.data_dir, eval_output, repo, args.n, method,
-                                  args.evaluation_seed, seed, None, args.evaluation_split, args.profile),
+                                  args.evaluation_seed, seed, None, args.evaluation_split, args.profile,
+                                  args.loss_normalization, loss_scale, benchmark=args.benchmark,
+                                  max_steps=args.max_steps, max_action_tokens=args.max_action_tokens),
                        args.execute, profile=args.profile)
                 evaluated[method].append(eval_output)
         if "rft" in evaluated and "grpo" in evaluated:

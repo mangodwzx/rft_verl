@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -77,6 +78,8 @@ class TrainingProfileTests(unittest.TestCase):
                 self.assertEqual(actor.ppo_micro_batch_size_per_gpu, 1)
                 self.assertEqual(config.actor_rollout_ref.model.lora.rank, 0)
                 self.assertEqual((config.algorithm.adv_estimator, actor.policy_loss.loss_mode), (advantage, loss))
+                self.assertEqual(actor.loss_agg_mode, "seq-mean-token-sum-norm")
+                self.assertEqual(actor.loss_scale_factor, 4096)
                 self.assertTrue(actor.fsdp_config.param_offload)
                 self.assertTrue(actor.fsdp_config.optimizer_offload)
                 self.assertFalse(actor.calculate_entropy)
@@ -98,12 +101,61 @@ class TrainingProfileTests(unittest.TestCase):
     def test_profile_does_not_mutate_defaults_and_has_distinct_output(self):
         _, lowmem_path = self.compose("--profile", "lowmem")
         default, default_path = self.compose()
-        self.assertEqual(lowmem_path, Path("runs_lowmem/qwen3_1p7b/rft/pilot/seed_42").resolve())
-        self.assertEqual(default_path, Path("runs/qwen3_1p7b/rft/pilot/seed_42").resolve())
+        self.assertEqual(lowmem_path, Path("runs_lowmem_fixed/qwen3_1p7b/rft/pilot/seed_42").resolve())
+        self.assertEqual(default_path, Path("runs_fixed/qwen3_1p7b/rft/pilot/seed_42").resolve())
         self.assertTrue(default.actor_rollout_ref.actor.calculate_entropy)
         self.assertFalse(default.actor_rollout_ref.actor.fsdp_config.param_offload)
         self.assertFalse(default.actor_rollout_ref.actor.fsdp_config.optimizer_offload)
         self.assertEqual(default.actor_rollout_ref.rollout.gpu_memory_utilization, 0.65)
+
+    def test_legacy_objective_and_output_remain_explicitly_available(self):
+        for method in ("rft", "grpo"):
+            with self.subTest(method=method):
+                config, path = self.compose("--method", method, "--profile", "lowmem",
+                                            "--loss-normalization", "per_response")
+                self.assertEqual(config.actor_rollout_ref.actor.loss_agg_mode, "seq-mean-token-mean")
+                self.assertIsNone(config.actor_rollout_ref.actor.loss_scale_factor)
+                self.assertEqual(path, Path(f"runs_lowmem/qwen3_1p7b/{method}/pilot/seed_42").resolve())
+
+    def test_fixed_scale_does_not_follow_batch_padding_or_response_limit(self):
+        for method in ("rft", "grpo"):
+            config, _ = self.compose("--method", method, "--loss-scale-factor", "2048",
+                                     "--set", "data.max_response_length=1024")
+            self.assertEqual(config.actor_rollout_ref.actor.loss_scale_factor, 2048)
+            self.assertIn("fixed_s2048", config.trainer.experiment_name)
+
+    def test_invalid_or_hidden_normalization_changes_are_rejected(self):
+        for options in (("--loss-scale-factor", "0"), ("--loss-scale-factor", "-1"),
+                        ("--loss-normalization", "per_response", "--loss-scale-factor", "4096"),
+                        ("--set", "actor_rollout_ref.actor.loss_scale_factor=null"),
+                        ("--set", "actor_rollout_ref.actor.loss_agg_mode=token-mean")):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.compose(*options)
+
+    def test_resume_cannot_change_legacy_objective_to_fixed(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "data"
+            data.mkdir()
+            for name in ("pilot", "dev"):
+                pq.write_table(pa.table({"id": list(range(64))}), data / f"{name}.parquet")
+            run = root / "runs/qwen3_1p7b/rft/pilot/seed_42"
+            run.mkdir(parents=True)
+            manifest = run / "run_manifest.json"
+            original = json.dumps({"profile": "default"})  # legacy record: no objective fields
+            manifest.write_text(original, encoding="utf-8")
+            argv = ["train", "--model", "qwen3_1p7b", "--method", "rft", "--data-dir", str(data),
+                    "--output-dir", str(root / "runs"), "--resume-from", str(run / "checkpoints/global_step_40")]
+            with patch.object(sys, "argv", argv), patch.object(train, "check_verl_revision", return_value={}), \
+                    patch.object(train, "_resolve_model", return_value=("unused", {})), \
+                    patch.object(train, "_source_hashes", return_value={}), \
+                    patch.object(train, "environment_versions", return_value={}), \
+                    self.assertRaisesRegex(ValueError, "training objective"):
+                train.main()
+            self.assertEqual(manifest.read_text(), original)
+            self.assertFalse((run / "resume_config.yaml").exists())
 
     def test_explicit_overrides_win_without_changing_global_batch(self):
         with tempfile.TemporaryDirectory() as temporary:

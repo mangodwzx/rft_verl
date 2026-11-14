@@ -1,5 +1,7 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
+  "loss_normalization": "fixed",
+  "loss_scale_factor": 4096,
   "verl_commit": "3c6d9b43b67c74ec343d77874cd8fa6e841523da",
   "models": ["qwen3_1p7b", "qwen3_4b", "qwen35_2b", "qwen35_4b"],
   "main_methods": ["rft", "grpo"],

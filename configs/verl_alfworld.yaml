@@ -1,0 +1,14 @@
+# One sample is a complete text-only ALFWorld episode. Observations consume
+# context/response space but are masked out of both training losses.
+alfworld:
+  max_steps: 50
+  max_action_tokens: 128
+actor_rollout_ref:
+  rollout:
+    multi_turn:
+      enable: true
+    agent:
+      default_agent_loop: alfworld
+reward:
+  custom_reward_function:
+    name: compute_score
