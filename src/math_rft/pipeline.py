@@ -56,7 +56,8 @@ def evaluation(model: str, data: Path, output: Path, repo: str, n: int, method: 
                evaluation_seed: int, training_seed: int | None, revision: str | None, split: str,
                profile: str = "default", loss_normalization: str | None = None,
                loss_scale_factor: int | None = None, benchmark: str = "math",
-               max_steps: int = 50, max_action_tokens: int = 128) -> list[str]:
+               max_steps: int = 50, max_action_tokens: int = 128,
+               env_workers: int = 0, resume_from: Path | None = None) -> list[str]:
     role = "formal" if split in ("math500", "test") else "development"
     args = ["math_rft.evaluate", "--model", model, "--data", str(data / f"{split}.jsonl"),
             "--output", str(output), "--role", role, "--n", str(n),
@@ -64,6 +65,10 @@ def evaluation(model: str, data: Path, output: Path, repo: str, n: int, method: 
     if benchmark == "alfworld":
         args += ["--benchmark", benchmark, "--max-steps", str(max_steps),
                  "--max-action-tokens", str(max_action_tokens)]
+        if env_workers:
+            args += ["--env-workers", str(env_workers)]
+        if resume_from is not None:
+            args += ["--resume-from", str(resume_from)]
     if training_seed is not None:
         args += ["--training-seed", str(training_seed)]
     if revision:
@@ -84,6 +89,10 @@ def main() -> None:
     parser.add_argument("--benchmark", choices=BENCHMARKS, default="math")
     parser.add_argument("--max-steps", type=int, default=50, help="ALFWorld actions per episode, train and eval")
     parser.add_argument("--max-action-tokens", type=int, default=128, help="ALFWorld tokens per action, train and eval")
+    parser.add_argument("--eval-env-workers", type=int, default=0,
+                        help="ALFWorld evaluation environment processes; does not change training workers")
+    parser.add_argument("--baseline-resume-from", type=Path,
+                        help="Import an inactive baseline ledger into a new pipeline output (one ALFWorld model)")
     parser.add_argument("--profile", choices=("default", "lowmem"), default="default",
                         help="lowmem changes execution memory settings, preserving training and evaluation budgets")
     parser.add_argument("--loss-normalization", choices=LOSS_NORMALIZATIONS, default="fixed",
@@ -103,6 +112,11 @@ def main() -> None:
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     parser.add_argument("--execute", action="store_true", help="Without this flag, print the plan and start no jobs")
     args = parser.parse_args()
+    if args.eval_env_workers < 0 or (args.benchmark != "alfworld" and
+                                   (args.eval_env_workers or args.baseline_resume_from)):
+        parser.error("Evaluation environment workers and baseline migration require ALFWorld and nonnegative workers")
+    if args.baseline_resume_from is not None and len(args.models) != 1:
+        parser.error("--baseline-resume-from requires exactly one model")
     try:
         _, loss_scale = loss_reduction(args.loss_normalization, args.loss_scale_factor)
     except ValueError as exc:
@@ -158,7 +172,8 @@ def main() -> None:
         baseline_output = args.output_dir / "baselines" / args.stage / model / f"{args.evaluation_split}.jsonl"
         invoke(evaluation(repo, args.data_dir, baseline_output, repo, args.n, "base", args.evaluation_seed,
                           None, revision, args.evaluation_split, args.profile, benchmark=args.benchmark,
-                          max_steps=args.max_steps, max_action_tokens=args.max_action_tokens),
+                          max_steps=args.max_steps, max_action_tokens=args.max_action_tokens,
+                          env_workers=args.eval_env_workers, resume_from=args.baseline_resume_from),
                args.execute, profile=args.profile)
         evaluated: dict[str, list[Path]] = {}
         for method in args.methods:
@@ -245,7 +260,8 @@ def main() -> None:
                 invoke(evaluation(str(exported), args.data_dir, eval_output, repo, args.n, method,
                                   args.evaluation_seed, seed, None, args.evaluation_split, args.profile,
                                   args.loss_normalization, loss_scale, benchmark=args.benchmark,
-                                  max_steps=args.max_steps, max_action_tokens=args.max_action_tokens),
+                                  max_steps=args.max_steps, max_action_tokens=args.max_action_tokens,
+                                  env_workers=args.eval_env_workers),
                        args.execute, profile=args.profile)
                 evaluated[method].append(eval_output)
         if "rft" in evaluated and "grpo" in evaluated:

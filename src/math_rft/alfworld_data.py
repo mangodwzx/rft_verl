@@ -22,6 +22,7 @@ from typing import Any
 import urllib.request
 import zipfile
 
+from .alfworld_demonstrations import DEMONSTRATION_SOURCE_IDS, DEMONSTRATIONS_VERSION, PROVENANCE_ARTIFACT_SHA256
 from .alfworld_env import AlfWorldEnvironment, environment_identity
 from .io_utils import canonical_json, read_jsonl, sha256_file, sha256_text, write_json, write_jsonl
 
@@ -173,6 +174,24 @@ def validate_disjoint_tasks(splits: dict[str, list[dict[str, Any]]]) -> None:
                 registry[key] = source_id
 
 
+def _exclude_demonstration_tasks(
+    splits: dict[str, list[dict[str, Any]]], excluded: dict[str, list[dict[str, str]]],
+) -> None:
+    """Reserve offline prompt examples without altering held-out populations."""
+    if any(not source_id.startswith("train/") for source_id in DEMONSTRATION_SOURCE_IDS):
+        raise ValueError("ALFWorld prompt demonstrations must come only from train tasks")
+    for split, tasks in splits.items():
+        if split != "train" and any(task["source_id"] in DEMONSTRATION_SOURCE_IDS for task in tasks):
+            raise ValueError("ALFWorld prompt demonstration overlaps a held-out task population")
+    retained = []
+    for task in splits["train"]:
+        if task["source_id"] in DEMONSTRATION_SOURCE_IDS:
+            excluded["train"].append({"source_id": task["source_id"], "reason": "prompt_demonstration"})
+        else:
+            retained.append(task)
+    splits["train"] = retained
+
+
 def select_pilot(rows: list[dict[str, Any]], count: int, seed: int) -> list[dict[str, Any]]:
     if type(count) is not int or count <= 0 or count > len(rows):
         raise ValueError(f"pilot_size must be between 1 and the available {len(rows)} training tasks")
@@ -231,7 +250,7 @@ def _write_split(output: Path, name: str, rows: list[dict[str, Any]]) -> dict[st
 
 
 def prepare(args: argparse.Namespace) -> None:
-    from .alfworld_episode import prompt_fingerprint
+    from .alfworld_episode import PROMPT_VERSION, prompt_fingerprint
 
     if args.seed < 0:
         raise ValueError("seed must be nonnegative")
@@ -246,6 +265,7 @@ def prepare(args: argparse.Namespace) -> None:
     for split in SOURCE_SPLITS:
         source_tasks[split], excluded[split] = discover_tasks(root, split)
     validate_disjoint_tasks(source_tasks)
+    _exclude_demonstration_tasks(source_tasks, excluded)
     if not 0 < args.pilot_size <= len(source_tasks["train"]):
         raise ValueError(f"pilot_size exceeds eligible training tasks ({len(source_tasks['train'])})")
     identity = environment_identity()
@@ -273,9 +293,14 @@ def prepare(args: argparse.Namespace) -> None:
             "schema_version": 1, "benchmark": "alfworld", "dataset_version": DATA_VERSION,
             "created_at_utc": datetime.now(timezone.utc).isoformat(), "data_root": str(root),
             "seed": args.seed, "pilot_size": args.pilot_size, "prompt_sha256": prompt_fingerprint(),
+            "prompt_version": PROMPT_VERSION,
+            "demonstrations": {"version": DEMONSTRATIONS_VERSION,
+                               "source_ids": sorted(DEMONSTRATION_SOURCE_IDS),
+                               "provenance_artifact_sha256": PROVENANCE_ARTIFACT_SHA256},
             "preparation_workers": workers,
             "environment": identity, "eligibility_reference": FILTER_SOURCE,
-            "split_policy": {"pilot": "stratified subset of train", "full": "all eligible train",
+            "split_policy": {"pilot": "stratified subset of train excluding prompt demonstrations",
+                             "full": "all eligible train excluding prompt demonstrations",
                              "dev": "valid_seen", "test": "valid_unseen", "debug": "up to 32 train tasks"},
             "excluded": excluded,
             "source_counts": {split: {"eligible": len(source_tasks[split]), "excluded": len(excluded[split])}

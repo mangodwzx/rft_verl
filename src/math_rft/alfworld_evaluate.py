@@ -6,6 +6,7 @@ histories belong to individual attempts; observations never enter actor loss.
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from datetime import datetime, timezone
 import importlib.metadata
 import itertools
@@ -13,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import time
 
 from math_rft import evaluate
 
@@ -119,7 +121,7 @@ class BatchedGenerator:
                     future.set_exception(exc)
 
 
-async def generate_batch(batch, engine, tokenizer, sampling_params, args):
+async def generate_batch(batch, engine, tokenizer, sampling_params, args, *, env_factory=None):
     from math_rft.alfworld_episode import run_episode
 
     generate = BatchedGenerator(engine, sampling_params, args)
@@ -130,6 +132,7 @@ async def generate_batch(batch, engine, tokenizer, sampling_params, args):
             row["extra_info"]["alfworld_task"], tokenizer, generate, seed=seed,
             max_steps=args.max_steps, max_action_tokens=args.max_action_tokens,
             max_response_tokens=args.max_tokens, max_prompt_tokens=args.max_prompt_tokens,
+            env_factory=env_factory,
         )
         if result.prompt_ids != row["prompt_token_ids"]:
             raise ValueError("Environment reset differs from the prepared/tokenized initial observation")
@@ -211,7 +214,19 @@ def run(args, rows: list[dict], paths: dict[str, Path]) -> None:
         config["training_objective"] = args.training_objective
     if getattr(args, "sharding", None) is not None:
         config["sharding"] = args.sharding
+    env_workers = getattr(args, "env_workers", 0)
+    if env_workers:
+        from math_rft import alfworld_pool
+        config["environment_execution"] = {
+            "kind": "spawn_process_pool", "workers": env_workers,
+            "source_sha256": evaluate.file_hash(Path(alfworld_pool.__file__)),
+        }
     manifest_hash = evaluate.canonical_hash(config)
+    if getattr(args, "resume_from", None) is not None:
+        from math_rft.evaluation_migration import migrate_evaluation
+        migrated = migrate_evaluation(args.resume_from, args.output, rows, config)
+        print(f"Verified migrated prefix: {migrated['resume_source']['records']} episodes "
+              f"from {migrated['resume_source']['path']}", flush=True)
     if paths["meta"].exists():
         old = json.loads(paths["meta"].read_text(encoding="utf-8"))
         if old.get("manifest_hash") != manifest_hash or old.get("config") != config:
@@ -252,9 +267,12 @@ def run(args, rows: list[dict], paths: dict[str, Path]) -> None:
             os.fsync(stream.fileno())
         temporary.replace(paths["prompts"])
     tasks = ((row, index) for row in token_rows for index in range(args.n) if (row["id"], index) not in completed)
-    with args.output.open("a", encoding="utf-8", newline="\n") as stream:
+    pool_context = alfworld_pool.EnvironmentPool(env_workers) if env_workers else nullcontext()
+    with pool_context as pool, args.output.open("a", encoding="utf-8", newline="\n") as stream:
         while batch := list(itertools.islice(tasks, args.batch_size)):
-            records = asyncio.run(generate_batch(batch, llm, tokenizer, SamplingParams, args))
+            started = time.monotonic()
+            records = asyncio.run(generate_batch(batch, llm, tokenizer, SamplingParams, args,
+                                                 env_factory=pool.factory if pool is not None else None))
             # An infrastructure exception leaves this whole batch uncommitted.
             for record in records:
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -262,5 +280,8 @@ def run(args, rows: list[dict], paths: dict[str, Path]) -> None:
                 completed.add((record["id"], record["sample_index"]))
             stream.flush()
             os.fsync(stream.fileno())
-            print(f"{len(completed)}/{len(rows) * args.n} ALFWorld episodes committed", flush=True)
+            elapsed = time.monotonic() - started
+            print(f"{len(completed)}/{len(rows) * args.n} ALFWorld episodes committed "
+                  f"(batch={len(records)}, seconds={elapsed:.2f}, "
+                  f"episodes/hour={len(records) * 3600 / elapsed:.1f}, env_workers={env_workers})", flush=True)
     evaluate.atomic_json(paths["summary"], evaluate.build_summary(rows, counts, manifest_hash, args.n))

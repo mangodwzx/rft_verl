@@ -50,6 +50,29 @@ class PipelinePlanTests(unittest.TestCase):
         self.assertEqual(len(training), 2)
         self.assertEqual({option(command, "--method") for command in training}, {"rft", "grpo"})
 
+    def test_alfworld_pool_and_baseline_migration_preserve_training_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "old" / "dev.jsonl"
+            commands = self.plan(Path(temporary), "--benchmark", "alfworld", "--profile", "lowmem",
+                                 "--models", "qwen3_1p7b", "--seeds", "42", "--eval-env-workers", "4",
+                                 "--baseline-resume-from", str(source))
+        evaluations = [command for command in commands if command[0] == "math_rft.evaluate"]
+        self.assertEqual(len(evaluations), 3)
+        for command in evaluations:
+            args = evaluate.resolve_execution_options(evaluate.parser().parse_args(command[1:]))
+            self.assertEqual((args.env_workers, args.n, args.max_steps, args.batch_size), (4, 256, 50, 8))
+            self.assertEqual(args.resume_from, source if args.method == "base" else None)
+        training = [command for command in commands if command[0] == "math_rft.train"]
+        self.assertEqual(len(training), 2)
+        self.assertTrue(all("--env-workers" not in command and "--resume-from" not in command for command in training))
+
+    def test_pool_and_migration_reject_wrong_benchmark_or_multiple_models(self):
+        for extra in (("--eval-env-workers", "4"),
+                      ("--benchmark", "alfworld", "--eval-env-workers", "-1"),
+                      ("--benchmark", "alfworld", "--baseline-resume-from", "old.jsonl")):
+            with tempfile.TemporaryDirectory() as temporary, redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.plan(Path(temporary), *extra)
+
     def test_full_defaults_to_four_models_and_three_training_seeds(self):
         with tempfile.TemporaryDirectory() as temporary:
             commands = self.plan(Path(temporary), "--stage", "full")

@@ -81,6 +81,28 @@ ALFWorld 的一条样本是一条从重置到结束的完整轨迹；`k` 表示�
 在流水线中同时传给训练和评测。完整轨迹的 4096 token 上限包含动作和中间观察，
 初始 prompt 上限 4096，总 context 上限 8192。固定 loss 尺度 S 不随实际轨迹长度改变。
 
+当前提示协议为 `alfworld_raw_actions_v3_fewshot`。使用冻结 TextWorld 游戏的动作语法：放置物体写
+`move OBJECT to LOCATION`，例如 `move potato 1 to countertop 1`；
+`put OBJECT in/on LOCATION` 及其 `in`、`on` 变体不适用于这里的普通放置动作。
+模型必须使用观察中的小写名称和数字 ID，每轮立即输出一行命令，不添加空行或说明。
+Base、RFT、GRPO 共用同一组 3 个固定、完整的离线成功示例，涵盖放置、照明检查和加热放置；
+示例的真实动作、观察、训练任务 ID 和资产哈希保存在
+`src/math_rft/alfworld_demonstrations.py`。这些示例任务从新准备的任务集合中排除，
+线上 rollout 不读取当前任务的专家动作或隐藏状态。
+
+v3 改变了 prompt 和数据指纹。已有 v1/v2 数据与运行结果必须保留，重新 `prepare` 到新目录，
+并为 Base、RFT、GRPO 使用新的输出目录；训练和流水线通过 `--data-dir` 指向新数据，
+独立评测通过 `--data` 指向对应 JSONL。不要用旧 checkpoint 或旧 baseline ledger 续跑新协议。
+真实 CPU 环境回归检查会从提示中提取放置命令，验证完整任务奖励为 1，并验证旧语法被拒绝：
+
+```bash
+RUN_ALFWORLD_INTEGRATION=1 PYTHONPATH=src python -m unittest discover \
+  -s tests -p 'test_alfworld_protocol_integration.py' -v
+```
+
+此检查需要本地 `data_alfworld/debug.jsonl`、对应游戏资产和 ALFWorld 依赖；不加载模型，
+普通测试发现默认跳过，显式启用后缺少依赖或资产也会跳过。
+
 只有环境 `won` 为真才奖励 1；未完成任务的轨迹为 0。无法解析成单行动作或预算耗尽会结束轨迹，
 环境/推理异常直接报错。合法格式但环境不接受的命令会返回反馈，模型可以继续尝试。
 RFT 只学习成功轨迹的动作 token；观察和插入的格式 token 的 loss mask 为 0。
@@ -309,6 +331,39 @@ CPU offload 在训练阶段仍需把状态载回 GPU；0.3 是生成引擎预算
 `--set` 可覆盖训练执行参数；独立评测的 `--batch-size`、`--gpu-memory-utilization`、
 `--max-num-seqs`、`--max-num-batched-tokens` 等显式参数优先于 profile 默认值。
 设置或源码变更后使用新输出目录；恢复训练时保留原 `--profile` 和全部覆盖参数。
+
+### ALFWorld 多进程环境与保留进度迁移
+
+ALFWorld 独立评测可加 `--env-workers 4`，让四个常驻 CPU 进程处理环境操作，
+共享主评测器的一个 vLLM 引擎。环境进程使用 spawn，不加载模型；每条轨迹固定在同一进程，
+保留原有 TextWorld 锁、任务状态隔离、动作规则和采样预算。默认 `0` 保留线程执行方式。
+完整流水线通过 `--eval-env-workers 4` 将此设置传给 Base、RFT、GRPO 的独立评测，
+不改变训练 worker 数量。评测日志同时显示每批耗时和吞吐。
+
+已有部分评测不能直接修改配置后续写。先正常停止旧流水线，确认其进程结束、评测锁已释放，
+再以新输出目录导入旧 ledger。下面命令保留每题 n=256、50 步和原模型版本：
+
+```bash
+source scripts/activate.sh
+# 使用原实验已经安排的设备；启动前重新确认显存资源。
+export CUDA_VISIBLE_DEVICES=0,1
+python -m math_rft.pipeline --benchmark alfworld --profile lowmem \
+  --stage pilot --models qwen3_1p7b --seeds 42 \
+  --model-revision ea980cb0a6c2ae4b936e82123acc929f1cec04c1 \
+  --set trainer.n_gpus_per_node=2 --eval-env-workers 4 \
+  --baseline-resume-from runs_alfworld_lowmem_fixed_pipeline/baselines/pilot/qwen3_1p7b/dev.jsonl \
+  --output-dir runs_alfworld_lowmem_parallel_pipeline --execute
+```
+
+迁移严格校验任务、模型、种子、样本数、环境版本、轨迹协议和推理参数，仅允许评测执行代码及
+环境进程配置变化。源 ledger 和 prompt 索引按字节复制，新 metadata 的 `resume_source` 保存
+完整旧 metadata、文件哈希和导入记录数；旧文件保持独立。随后只补齐缺失的任务/样本编号。
+新旧调度可能产生不同的具体生成结果，metadata 明确标记旧记录前缀，不能把迁移结果声称为
+全部由新执行配置生成。再次使用相同命令会校验旧记录前缀并继续未完成部分。
+独立评测入口使用 `--resume-from OLD.jsonl --output NEW.jsonl --env-workers 4`。
+
+可用 `scripts/benchmark_alfworld_pool.py` 在独立目录做线程/进程性能对照；该脚本保留
+完整 episode 协议，不将短测记录加入正式实验。单纯增大 batch 无法消除进程内环境锁的排队。
 
 ### 已训练模型的高吞吐重新评测
 

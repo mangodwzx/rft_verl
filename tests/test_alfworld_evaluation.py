@@ -152,6 +152,32 @@ class AlfWorldEvaluationTests(unittest.TestCase):
                     evaluate.main(self.args(data, output))
                 self.assertEqual(output.read_bytes(), before)
 
+    def test_partial_ledger_migration_only_generates_missing_samples(self):
+        from math_rft import alfworld_pool
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data, _ = self.dataset(root)
+            source, output = root / "old.jsonl", root / "parallel.jsonl"
+            with runtime() as (events, engines):
+                evaluate.main(self.args(data, source))
+                prefix = b"".join(source.read_bytes().splitlines(keepends=True)[:3])
+                source.write_bytes(prefix)
+                evaluate.artifact_paths(source)["summary"].unlink()
+                with patch.object(alfworld_pool, "EnvironmentPool") as pool:
+                    pool.return_value.__enter__.return_value.factory = alfworld_env.AlfWorldEnvironment
+                    args = self.args(data, output, "--env-workers", "4", "--resume-from", str(source))
+                    evaluate.main(args)
+                    evaluate.main(args)
+                self.assertEqual(len(engines), 2)
+                self.assertEqual(sum(event[0] == "reset" for event in events), 9)
+            self.assertEqual(source.read_bytes(), prefix)
+            self.assertTrue(output.read_bytes().startswith(prefix))
+            self.assertEqual(len(list(evaluate.read_jsonl(output))), 6)
+            run = load_run(output)
+            self.assertEqual(run["config"]["environment_execution"]["workers"], 4)
+            self.assertIn("resume_source", run["meta"])
+
     def test_formal_checks_whole_unseen_split_and_development_excludes_it(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

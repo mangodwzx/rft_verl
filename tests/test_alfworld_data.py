@@ -114,9 +114,77 @@ class AlfWorldDiscoveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             data.select_pilot(rows, 21, 42)
 
+    def test_held_out_demonstrations_are_rejected_instead_of_removed(self):
+        for source_id in ("valid_seen/example", "valid_unseen/example"):
+            with self.subTest(source_id=source_id), \
+                    patch.object(data, "DEMONSTRATION_SOURCE_IDS", frozenset({source_id})):
+                splits = {split: [{"source_id": f"{split}/example"}] for split in data.SOURCE_SPLITS}
+                excluded = {split: [] for split in data.SOURCE_SPLITS}
+                with self.assertRaisesRegex(ValueError, "only from train"):
+                    data._exclude_demonstration_tasks(splits, excluded)
+                self.assertEqual([len(tasks) for tasks in splits.values()], [1, 1, 1])
+                self.assertTrue(all(not entries for entries in excluded.values()))
+
 
 @unittest.skipUnless(importlib.util.find_spec("pyarrow"), "Requires project data stack")
 class AlfWorldPreparationTests(unittest.TestCase):
+    def test_demonstration_tasks_are_excluded_before_train_sampling_only(self):
+        from math_rft.alfworld_episode import PROMPT_VERSION
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for split, names in {"train": ("example", "a", "b", "c"),
+                                 "valid_seen": ("d", "e"), "valid_unseen": ("f", "g")}.items():
+                for name in names:
+                    write_task(root / "source", split, name)
+            output = root / "prepared"
+            args = data.parser().parse_args(["prepare", "--data-root", str(root / "source"),
+                                             "--output-dir", str(output), "--pilot-size", "2", "--workers", "1"])
+            with patch.object(data, "DEMONSTRATION_SOURCE_IDS", frozenset({"train/example"})), \
+                    patch.object(data, "AlfWorldEnvironment", side_effect=FakeEnvironment) as environment, \
+                    patch.object(data, "environment_identity", return_value={"test": "fake"}):
+                data.prepare(args)
+            manifest = json.loads((output / "manifest.json").read_text())
+            self.assertEqual({name: row["count"] for name, row in manifest["splits"].items()},
+                             {"pilot": 2, "full": 3, "debug": 3, "dev": 2, "test": 2})
+            for name in ("pilot", "full", "debug"):
+                rows = read_jsonl(output / f"{name}.jsonl")
+                self.assertNotIn("alfworld:train/example", {row["id"] for row in rows})
+                self.assertTrue(all(row["source_split"] == "train" for row in rows))
+            self.assertEqual({row["source_id"] for row in read_jsonl(output / "dev.jsonl")},
+                             {"valid_seen/d", "valid_seen/e"})
+            self.assertEqual({row["source_id"] for row in read_jsonl(output / "test.jsonl")},
+                             {"valid_unseen/f", "valid_unseen/g"})
+            self.assertNotIn("train/example", {call.args[0]["source_id"] for call in environment.call_args_list})
+            self.assertEqual(manifest["excluded"], {
+                "train": [{"source_id": "train/example", "reason": "prompt_demonstration"}],
+                "valid_seen": [], "valid_unseen": [],
+            })
+            self.assertEqual(manifest["source_counts"]["train"], {"eligible": 3, "excluded": 1})
+            self.assertEqual(manifest["prompt_version"], PROMPT_VERSION)
+            self.assertEqual(manifest["demonstrations"], {
+                "version": data.DEMONSTRATIONS_VERSION, "source_ids": ["train/example"],
+                "provenance_artifact_sha256": data.PROVENANCE_ARTIFACT_SHA256,
+            })
+
+    def test_duplicate_demonstration_game_in_heldout_split_is_not_hidden_by_exclusion(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            demonstration = write_task(root / "source", "train", "example")
+            write_task(root / "source", "train", "other")
+            heldout = write_task(root / "source", "valid_seen", "copied_example")
+            (heldout / "game.tw-pddl").write_bytes((demonstration / "game.tw-pddl").read_bytes())
+            write_task(root / "source", "valid_unseen", "test")
+            output = root / "prepared"
+            args = data.parser().parse_args(["prepare", "--data-root", str(root / "source"),
+                                             "--output-dir", str(output), "--pilot-size", "1", "--workers", "1"])
+            with patch.object(data, "DEMONSTRATION_SOURCE_IDS", frozenset({"train/example"})), \
+                    patch.object(data, "_observe_task") as observe, \
+                    self.assertRaisesRegex(ValueError, "overlapping"):
+                data.prepare(args)
+            observe.assert_not_called()
+            self.assertFalse(output.exists())
+
     def test_preparation_preserves_official_splits_and_private_state_is_not_prompted(self):
         import pyarrow.parquet as pq
 

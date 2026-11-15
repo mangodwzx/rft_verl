@@ -75,12 +75,12 @@ class EpisodeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_success_keeps_exact_actions_and_masks_only_environment_context(self):
         result = await self.run_task(
-            ["take mug 1 from shelf 1\n", "put mug 1 in/on table 1\n"],
+            ["take mug 1 from shelf 1\n", "move mug 1 to table 1\n"],
             [("You take the mug.", False, False, {}), ("You win!", True, True, {})],
         )
         first = self.tokenizer.encode("take mug 1 from shelf 1\n")
         observation = self.tokenizer.encode("\nObservation: You take the mug.\nAction:")
-        second = self.tokenizer.encode("put mug 1 in/on table 1\n")
+        second = self.tokenizer.encode("move mug 1 to table 1\n")
         self.assertEqual(result.score, 1)
         self.assertEqual(result.termination, "success")
         self.assertEqual(result.response_ids, first + observation + second)
@@ -90,7 +90,7 @@ class EpisodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.requests[1][0], result.prompt_ids + first + observation)
         self.assertEqual(result.turns[-1]["observation"], "You win!")
         self.assertNotIn("You win!", result.text)  # terminal observation is not trained
-        self.assertEqual(self.environments[0].actions, ["take mug 1 from shelf 1", "put mug 1 in/on table 1"])
+        self.assertEqual(self.environments[0].actions, ["take mug 1 from shelf 1", "move mug 1 to table 1"])
         self.assertTrue(self.environments[0].closed)
 
     async def test_independent_attempts_reset_and_do_not_share_history(self):

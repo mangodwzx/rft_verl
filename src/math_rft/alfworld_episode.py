@@ -12,15 +12,19 @@ import math
 import time
 from typing import Any, Awaitable, Callable
 
-PROMPT_VERSION = "alfworld_raw_actions_v1"
+from .alfworld_demonstrations import render_demonstration_prefix
+
+PROMPT_VERSION = "alfworld_raw_actions_v3_fewshot"
 GRADER_VERSION = "alfworld_textworld_success_v1"
 STOP_STRINGS = ["\n"]
 INSTRUCTION = (
     "You are an agent in a text household environment. Complete the task by interacting with the environment.\n"
-    "Output exactly one environment command on one line at each Action: prompt. "
-    "Do not write explanations or invent observations. Use object and location names from the observations.\n"
+    "At each Action: prompt, write exactly one command immediately, without a leading newline or blank line. "
+    "Do not add markdown, quotes, punctuation, explanations, or observations. "
+    "Do not join multiple commands with semicolons.\n"
+    "Use the exact lowercase object and location names and numeric IDs shown in the observations.\n"
     "Commands include: look; inventory; go to LOCATION; open OBJECT; close OBJECT; "
-    "take OBJECT from LOCATION; put OBJECT in/on LOCATION; clean OBJECT with TOOL; "
+    "take OBJECT from LOCATION; move OBJECT to LOCATION; clean OBJECT with TOOL; "
     "heat OBJECT with TOOL; cool OBJECT with TOOL; use OBJECT.\n"
     "The environment will report the result after each action."
 )
@@ -29,7 +33,7 @@ INSTRUCTION = (
 def render_prompt(initial_observation: str) -> str:
     if not isinstance(initial_observation, str) or not initial_observation.strip():
         raise ValueError("ALFWorld initial observation must be a nonempty string")
-    return f"{INSTRUCTION}\n\nObservation: {initial_observation}\nAction:"
+    return f"{INSTRUCTION}\n\n{render_demonstration_prefix()}\n\nObservation: {initial_observation}\nAction:"
 
 
 def prompt_fingerprint() -> str:

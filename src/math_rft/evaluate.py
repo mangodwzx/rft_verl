@@ -233,6 +233,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-prompt-tokens", type=int, default=4096)
     result.add_argument("--max-steps", type=int, default=50, help="ALFWorld: maximum environment actions per episode")
     result.add_argument("--max-action-tokens", type=int, default=128, help="ALFWorld: maximum model tokens per action")
+    result.add_argument("--env-workers", type=int, default=0,
+                        help="ALFWorld environment processes sharing one inference engine; 0 uses local threads")
+    result.add_argument("--resume-from", type=Path,
+                        help="Import an inactive ALFWorld ledger into a new output with explicit execution provenance")
     result.add_argument("--batch-size", type=int, help="Requests per generation call: default 32; lowmem 8; throughput 256")
     result.add_argument("--tensor-parallel-size", type=int, default=1)
     result.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="bfloat16")
@@ -292,6 +296,8 @@ def training_objective(method: str, normalization: str | None, scale_factor: int
 
 def main(argv: list[str] | None = None) -> None:
     args = resolve_execution_options(parser().parse_args(argv))
+    if args.env_workers < 0 or (args.benchmark != "alfworld" and (args.env_workers or args.resume_from)):
+        raise ValueError("Environment workers and ledger migration require ALFWorld; workers must be nonnegative")
     args.training_objective = training_objective(
         args.method, args.training_loss_normalization, args.training_loss_scale_factor,
     )
