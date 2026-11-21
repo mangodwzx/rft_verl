@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from .io_utils import sha256_file, write_json
 from .train import BENCHMARKS, LOSS_NORMALIZATIONS, default_output_dir, loss_reduction
+from .reevaluate import evaluation_shards, execution_options, parallel_evaluations, validate_gpus
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -73,13 +75,28 @@ def evaluation(model: str, data: Path, output: Path, repo: str, n: int, method: 
         args += ["--training-seed", str(training_seed)]
     if revision:
         args += ["--revision", revision]
-    if profile == "lowmem":
+    if profile in {"lowmem", "throughput"}:
         args += ["--profile", profile]
     if loss_normalization is not None:
         args += ["--training-loss-normalization", loss_normalization]
         if loss_scale_factor is not None:
             args += ["--training-loss-scale-factor", str(loss_scale_factor)]
     return args
+
+
+def invoke_trained_evaluation(arguments: list[str], execute: bool, *, profile: str,
+                              gpus: list[str] | None, output_root: Path) -> None:
+    """Keep evaluator GPU placement separate from baseline and training jobs."""
+    shards, merge = evaluation_shards(arguments, gpus, output_root)
+    if gpus is None:
+        invoke(shards[0], execute, profile=profile)
+    else:
+        for shard, gpu in zip(shards, gpus, strict=True):
+            print(f"CUDA_VISIBLE_DEVICES={gpu} {shlex.join([sys.executable, '-u', '-m', *shard])}", flush=True)
+        if execute:
+            parallel_evaluations(shards, gpus)
+    if merge is not None:
+        invoke(merge, execute, profile=profile)
 
 
 def main() -> None:
@@ -93,6 +110,17 @@ def main() -> None:
                         help="ALFWorld evaluation environment processes; does not change training workers")
     parser.add_argument("--baseline-resume-from", type=Path,
                         help="Import an inactive baseline ledger into a new pipeline output (one ALFWorld model)")
+    parser.add_argument("--trained-eval-gpus", nargs="+",
+                        help="Physical GPUs for independent trained-model evaluation shards; baseline/training unchanged")
+    parser.add_argument("--trained-eval-profile", choices=("default", "lowmem", "throughput"),
+                        help="Trained-model evaluation profile; default: inherit --profile")
+    parser.add_argument("--trained-eval-env-workers", type=int,
+                        help="ALFWorld CPU workers per trained-model evaluator/GPU; default: --eval-env-workers")
+    parser.add_argument("--trained-eval-batch-size", type=int)
+    parser.add_argument("--trained-eval-max-num-seqs", type=int)
+    parser.add_argument("--trained-eval-max-num-batched-tokens", type=int)
+    parser.add_argument("--trained-eval-gpu-memory-utilization", type=float)
+    parser.add_argument("--trained-eval-enforce-eager", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--profile", choices=("default", "lowmem"), default="default",
                         help="lowmem changes execution memory settings, preserving training and evaluation budgets")
     parser.add_argument("--loss-normalization", choices=LOSS_NORMALIZATIONS, default="fixed",
@@ -117,6 +145,27 @@ def main() -> None:
         parser.error("Evaluation environment workers and baseline migration require ALFWorld and nonnegative workers")
     if args.baseline_resume_from is not None and len(args.models) != 1:
         parser.error("--baseline-resume-from requires exactly one model")
+    try:
+        validate_gpus(args.trained_eval_gpus, "--trained-eval-gpus")
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.trained_eval_env_workers is not None and (
+            args.trained_eval_env_workers < 0 or (args.trained_eval_env_workers and args.benchmark != "alfworld")):
+        parser.error("--trained-eval-env-workers requires ALFWorld and nonnegative workers")
+    for name in ("batch_size", "max_num_seqs", "max_num_batched_tokens"):
+        value = getattr(args, "trained_eval_" + name)
+        if value is not None and value < 1:
+            parser.error(f"--trained-eval-{name.replace('_', '-')} must be positive")
+    memory = args.trained_eval_gpu_memory_utilization
+    if memory is not None and (not math.isfinite(memory) or not 0 < memory < 1):
+        parser.error("--trained-eval-gpu-memory-utilization must be finite and in (0,1)")
+    trained_profile = args.trained_eval_profile or args.profile
+    trained_env_workers = (args.eval_env_workers if args.trained_eval_env_workers is None
+                           else args.trained_eval_env_workers)
+    trained_options = execution_options(argparse.Namespace(**{
+        name: getattr(args, "trained_eval_" + name) for name in
+        ("batch_size", "max_num_seqs", "max_num_batched_tokens", "gpu_memory_utilization", "enforce_eager")
+    }))
     try:
         _, loss_scale = loss_reduction(args.loss_normalization, args.loss_scale_factor)
     except ValueError as exc:
@@ -257,12 +306,16 @@ def main() -> None:
                     # it only from a successful training completion marker.
                     exported = run_dir / "checkpoints" / "FINAL_GLOBAL_STEP" / "actor" / "huggingface"
                 eval_output = run_dir / f"{args.evaluation_split}.jsonl"
-                invoke(evaluation(str(exported), args.data_dir, eval_output, repo, args.n, method,
-                                  args.evaluation_seed, seed, None, args.evaluation_split, args.profile,
-                                  args.loss_normalization, loss_scale, benchmark=args.benchmark,
-                                  max_steps=args.max_steps, max_action_tokens=args.max_action_tokens,
-                                  env_workers=args.eval_env_workers),
-                       args.execute, profile=args.profile)
+                trained_evaluation = evaluation(
+                    str(exported), args.data_dir, eval_output, repo, args.n, method,
+                    args.evaluation_seed, seed, None, args.evaluation_split, trained_profile,
+                    args.loss_normalization, loss_scale, benchmark=args.benchmark,
+                    max_steps=args.max_steps, max_action_tokens=args.max_action_tokens,
+                    env_workers=trained_env_workers,
+                )
+                invoke_trained_evaluation([*trained_evaluation, *trained_options], args.execute,
+                                          profile=trained_profile, gpus=args.trained_eval_gpus,
+                                          output_root=args.output_dir)
                 evaluated[method].append(eval_output)
         if "rft" in evaluated and "grpo" in evaluated:
             comparison_dir = args.output_dir / "comparisons" / args.stage / model / "rft_vs_grpo"

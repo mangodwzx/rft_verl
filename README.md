@@ -365,6 +365,31 @@ python -m math_rft.pipeline --benchmark alfworld --profile lowmem \
 可用 `scripts/benchmark_alfworld_pool.py` 在独立目录做线程/进程性能对照；该脚本保留
 完整 episode 协议，不将短测记录加入正式实验。单纯增大 batch 无法消除进程内环境锁的排队。
 
+流水线可为训练后的 RFT/GRPO 评测单独指定执行参数，保留 Base 的原始 lowmem 配置和迁移能力：
+
+```bash
+python -m math_rft.pipeline --benchmark alfworld --profile lowmem \
+  --stage pilot --models qwen3_1p7b --seeds 42 \
+  --model-revision ea980cb0a6c2ae4b936e82123acc929f1cec04c1 \
+  --data-dir data_alfworld_tw_v3 --output-dir runs_alfworld_tw_v3_fast_pipeline \
+  --set trainer.n_gpus_per_node=2 --eval-env-workers 8 \
+  --trained-eval-gpus 0 6 --trained-eval-profile lowmem \
+  --trained-eval-batch-size 16 --trained-eval-env-workers 8
+```
+
+该命令只打印计划，确认资源和短测吞吐后加 `--execute`。如需导入已停止的 Base 部分结果，另加
+`--baseline-resume-from OLD.jsonl`；所有原有训练 `--set` 参数仍须保留。Base 仍是 batch=8、
+单个推理引擎，训练仍使用原训练配置。只有训练后评测在指定物理 GPU 上各加载一个模型副本（TP=1），
+按题目分片，每题仍采样 256 次；每张卡各用 8 个环境进程。两个分片都成功后才合并为原有的
+`rft/grpo/pilot/seed_42/dev.jsonl`，后续比较读取合并结果。分片失败会终止本轮评测，避免合并不完整结果。
+
+`--trained-eval-profile` 默认继承 `--profile`，`--trained-eval-env-workers` 默认继承
+`--eval-env-workers`；不指定 GPU 时保持原有评测设备选择。还可设置
+`--trained-eval-max-num-seqs`、`--trained-eval-max-num-batched-tokens`、
+`--trained-eval-gpu-memory-utilization` 和 `--no-trained-eval-enforce-eager`。
+这些选项不改变训练、样本数、种子或 episode 长度。执行配置仍写入各评测 manifest，已有评测不能
+换配置后直接续写；已训练矩阵的源码请求也保持严格校验，应在首个训练开始前确定代码和配置。
+
 ### 已训练模型的高吞吐重新评测
 
 独立评测新增 `--profile throughput`，适用于本机 Qwen3-1.7B / A800 80GB：
@@ -374,6 +399,10 @@ python -m math_rft.pipeline --benchmark alfworld --profile lowmem \
 仍使用 BF16、每题 n=256、回答上限 4096、上下文 8192 和原采样种子、温度、判分规则。
 训练的 `--profile` 不受此设置影响。
 首次启动会编译和捕获 CUDA Graph；随后每一批请求全部生成、判分并保存后才打印样本进度。
+
+ALFWorld 重评应显式使用 `--env-workers`（例如 `--env-workers 8`），该数量对每张评测 GPU
+分别生效。可先短测 `--profile lowmem --batch-size 16 --env-workers 8`；上述默认 throughput
+大批次主要面向文本生成，其 ALFWorld 吞吐仍取决于环境并行度和 episode 长度。
 
 `math_rft.reevaluate` 从已有 `training_complete.json` 读取最终模型，校验训练完成记录后，
 依次重新评测 RFT 和 GRPO，再生成配对比较和 PNG/PDF 图表。它不启动训练，结果写入独立目录：

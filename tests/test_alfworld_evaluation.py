@@ -253,16 +253,23 @@ class AlfWorldEvaluationTests(unittest.TestCase):
                 run = source / "qwen3_1p7b" / method / "pilot/seed_42"
                 run.mkdir(parents=True)
                 (run / "run_manifest.json").write_text(json.dumps({"benchmark": "alfworld"}))
-            args = reevaluate.parser().parse_args([
-                "--run-root", str(source), "--output-dir", str(output), "--data-dir", str(data.parent)])
             fake_protocol = {"base_revision": "a" * 40, "data_sha256": {}, "training_objective": None,
                              "benchmark": "alfworld", "alfworld": protocol}
-            with patch.object(reevaluate, "final_model", return_value=(root / "export", fake_protocol)):
-                commands = reevaluate.plan(args)
-            for command in commands[:2]:
-                self.assertEqual(command[command.index("--benchmark") + 1], "alfworld")
-                self.assertEqual(command[command.index("--max-steps") + 1], "7")
-                self.assertEqual(command[command.index("--max-action-tokens") + 1], "31")
+            for gpus in ([], ["--gpus", "0", "6"]):
+                args = reevaluate.parser().parse_args([
+                    "--run-root", str(source), "--output-dir", str(output), "--data-dir", str(data.parent),
+                    "--env-workers", "8", "--profile", "lowmem", "--batch-size", "16", *gpus])
+                with patch.object(reevaluate, "final_model", return_value=(root / "export", fake_protocol)):
+                    commands = reevaluate.plan(args)
+                evaluations = [command for command in commands if command[0] == "math_rft.evaluate"]
+                self.assertEqual(len(evaluations), 4 if gpus else 2)
+                for command in evaluations:
+                    parsed = evaluate.resolve_execution_options(evaluate.parser().parse_args(command[1:]))
+                    self.assertEqual(parsed.benchmark, "alfworld")
+                    self.assertEqual((parsed.max_steps, parsed.max_action_tokens), (7, 31))
+                    self.assertEqual((parsed.env_workers, parsed.batch_size), (8, 16))
+                    self.assertEqual((parsed.n, parsed.seed, parsed.training_seed), (256, 20261025, 42))
+                    self.assertEqual(parsed.num_shards, 2 if gpus else 1)
             self.assertFalse(output.exists())
 
 

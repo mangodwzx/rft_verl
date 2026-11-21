@@ -36,10 +36,14 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--stage", choices=STAGES, default="pilot")
     cli.add_argument("--seed", type=int, default=42, help="Training seed of the completed trials")
     cli.add_argument("--methods", choices=("rft", "grpo"), nargs="+", default=["rft", "grpo"])
+    cli.add_argument("--include-base", action="store_true",
+                     help="Also evaluate the frozen base revision used to train the selected checkpoints")
     cli.add_argument("--data-dir", type=Path, help="Default: data or data_alfworld according to the recorded benchmark")
     cli.add_argument("--split", choices=("dev", "math500", "test"), help="Default: dev for pilot, benchmark test otherwise")
     cli.add_argument("--max-steps", type=int, help="ALFWorld episode limit; default: recorded training setting")
     cli.add_argument("--max-action-tokens", type=int, help="ALFWorld action token limit; default: recorded training setting")
+    cli.add_argument("--env-workers", type=int, default=0,
+                     help="ALFWorld CPU environment processes per evaluator/GPU; 0 uses local threads")
     cli.add_argument("--profile", choices=("default", "lowmem", "throughput"), default="throughput")
     cli.add_argument("--n", type=int, default=256)
     cli.add_argument("--evaluation-seed", type=int, default=20261025)
@@ -122,6 +126,41 @@ def execution_options(args: argparse.Namespace) -> list[str]:
     return options
 
 
+def validate_gpus(gpus: list[str] | None, option: str = "--gpus") -> None:
+    if gpus is not None and (not gpus or len(set(gpus)) != len(gpus)
+            or any(not re.fullmatch(r"0|[1-9][0-9]*", gpu) for gpu in gpus)):
+        raise ValueError(f"{option} requires distinct nonnegative canonical GPU IDs, e.g. {option} 0 6")
+
+
+def evaluation_shards(evaluation: list[str], gpus: list[str] | None,
+                      output_root: Path) -> tuple[list[list[str]], list[str] | None]:
+    """Plan independent model replicas and an optional complete-ledger merge."""
+    validate_gpus(gpus)
+    root = output_root.resolve()
+    result = Path(evaluation[evaluation.index("--output") + 1]).resolve()
+    data = evaluation[evaluation.index("--data") + 1]
+    if not result.is_relative_to(root):
+        raise ValueError(f"Evaluation output escapes --output-dir through a symlink: {result}")
+    if gpus is None or len(gpus) == 1:
+        if gpus is not None and not Path(str(result) + ".log").resolve().is_relative_to(root):
+            raise ValueError(f"Evaluation log escapes --output-dir through a symlink: {result}")
+        return [evaluation], None
+    commands, shards = [], []
+    for index in range(len(gpus)):
+        directory = f"shard_{index:05d}_of_{len(gpus):05d}"
+        shard = (result.parent / "shards" / directory / result.name).resolve()
+        log = Path(str(shard) + ".log").resolve()
+        if not shard.is_relative_to(root) or not log.is_relative_to(root):
+            raise ValueError(f"Shard output or log escapes --output-dir through a symlink: {shard}")
+        shards.append(shard)
+        command = evaluation.copy()
+        command[command.index("--output") + 1] = str(shard)
+        commands.append([*command, "--num-shards", str(len(gpus)), "--shard-index", str(index)])
+    merge = ["math_rft.merge_evaluations", "--inputs", *map(str, shards),
+             "--data", data, "--output", str(result)]
+    return commands, merge
+
+
 def plan(args: argparse.Namespace) -> list[list[str]]:
     models = json.loads((ROOT / "configs/models.json").read_text(encoding="utf-8"))
     matrix = json.loads((ROOT / "configs/experiment.json").read_text(encoding="utf-8"))
@@ -131,9 +170,9 @@ def plan(args: argparse.Namespace) -> list[list[str]]:
         raise ValueError("Re-evaluation requires n>=256 and nonnegative training/evaluation seeds")
     if len(set(args.methods)) != len(args.methods):
         raise ValueError("Duplicate methods are not allowed")
-    if args.gpus is not None and (not args.gpus or len(set(args.gpus)) != len(args.gpus)
-            or any(not re.fullmatch(r"0|[1-9][0-9]*", gpu) for gpu in args.gpus)):
-        raise ValueError("--gpus requires distinct nonnegative canonical GPU IDs, e.g. --gpus 2 6")
+    validate_gpus(args.gpus)
+    if args.env_workers < 0:
+        raise ValueError("--env-workers must be nonnegative")
     for name in ("batch_size", "max_num_seqs", "max_num_batched_tokens", "max_steps", "max_action_tokens"):
         value = getattr(args, name)
         if value is not None and value < 1:
@@ -149,6 +188,8 @@ def plan(args: argparse.Namespace) -> list[list[str]]:
     benchmark = args.benchmark or recorded_benchmark
     if benchmark != recorded_benchmark:
         raise ValueError("Requested benchmark differs from the completed training benchmark")
+    if args.env_workers and benchmark != "alfworld":
+        raise ValueError("--env-workers requires ALFWorld")
     if benchmark == "alfworld" and args.stage not in {"pilot", "full"}:
         raise ValueError("ALFWorld supports pilot and full stages")
     split = args.split or ("dev" if args.stage == "pilot" else "test" if benchmark == "alfworld" else "math500")
@@ -161,6 +202,7 @@ def plan(args: argparse.Namespace) -> list[list[str]]:
     role = "formal" if split in {"math500", "test"} else "development"
     repo_id = models[args.model]["repo_id"]
     commands, results = [], {}
+    targets = []
     reference_protocol = None
     # Validate all selected checkpoints before launching even the first evaluator.
     for method in args.methods:
@@ -171,6 +213,9 @@ def plan(args: argparse.Namespace) -> list[list[str]]:
             raise ValueError("Paired trials have different training benchmarks")
         if reference_protocol is None:
             reference_protocol = training_protocol
+            if args.include_base:
+                targets.append(("base", repo_id, Path("baselines") / args.stage / args.model,
+                                ["--revision", training_protocol["base_revision"]]))
         elif training_protocol["base_revision"] != reference_protocol["base_revision"]:
             raise ValueError("Paired trials have different frozen base model revisions")
         elif training_protocol["data_sha256"] != reference_protocol["data_sha256"]:
@@ -179,44 +224,35 @@ def plan(args: argparse.Namespace) -> list[list[str]]:
             raise ValueError("Paired trials have different or unknown training objective provenance")
         elif training_protocol["alfworld"] != reference_protocol["alfworld"]:
             raise ValueError("Paired trials have different ALFWorld episode protocols")
+        model_options = ["--training-seed", str(args.seed)]
+        objective = training_protocol["training_objective"]
+        if objective is not None:
+            model_options += ["--training-loss-normalization", objective["loss_normalization"]]
+            if objective["loss_scale_factor"] is not None:
+                model_options += ["--training-loss-scale-factor", str(objective["loss_scale_factor"])]
+        targets.append((method, str(exported), relative, model_options))
+
+    options = execution_options(args)
+    if benchmark == "alfworld":
+        episode = reference_protocol["alfworld"]
+        options += ["--benchmark", "alfworld",
+                    "--max-steps", str(args.max_steps if args.max_steps is not None else episode["max_steps"]),
+                    "--max-action-tokens", str(args.max_action_tokens if args.max_action_tokens is not None else episode["max_action_tokens"])]
+        if args.env_workers:
+            options += ["--env-workers", str(args.env_workers)]
+    for method, model, relative, model_options in targets:
         result = (output / relative / f"{split}.jsonl").resolve()
-        if not result.is_relative_to(output):
-            raise ValueError(f"Evaluation output escapes --output-dir through a symlink: {result}")
         results[method] = result
         evaluation = [
-            "math_rft.evaluate", "--profile", args.profile, "--model", str(exported),
+            "math_rft.evaluate", "--profile", args.profile, "--model", model,
             "--data", str(data), "--output", str(result), "--role", role, "--n", str(args.n),
             "--seed", str(args.evaluation_seed), "--method", method, "--base-model", repo_id,
-            "--training-seed", str(args.seed), *execution_options(args),
+            *model_options, *options,
         ]
-        objective = training_protocol["training_objective"]
-        if benchmark == "alfworld":
-            episode = training_protocol["alfworld"]
-            evaluation += ["--benchmark", "alfworld",
-                           "--max-steps", str(args.max_steps if args.max_steps is not None else episode["max_steps"]),
-                           "--max-action-tokens", str(args.max_action_tokens if args.max_action_tokens is not None else episode["max_action_tokens"])]
-        if objective is not None:
-            evaluation += ["--training-loss-normalization", objective["loss_normalization"]]
-            if objective["loss_scale_factor"] is not None:
-                evaluation += ["--training-loss-scale-factor", str(objective["loss_scale_factor"])]
-        if args.gpus is None or len(args.gpus) == 1:
-            if args.gpus is not None and not Path(str(result) + ".log").resolve().is_relative_to(output):
-                raise ValueError(f"Evaluation log escapes --output-dir through a symlink: {result}")
-            commands.append(evaluation)
-        else:
-            shards = []
-            for index in range(len(args.gpus)):
-                directory = f"shard_{index:05d}_of_{len(args.gpus):05d}"
-                shard = (result.parent / "shards" / directory / result.name).resolve()
-                log = Path(str(shard) + ".log").resolve()
-                if not shard.is_relative_to(output) or not log.is_relative_to(output):
-                    raise ValueError(f"Shard output or log escapes --output-dir through a symlink: {shard}")
-                shards.append(shard)
-                command = evaluation.copy()
-                command[command.index("--output") + 1] = str(shard)
-                commands.append([*command, "--num-shards", str(len(args.gpus)), "--shard-index", str(index)])
-            commands.append(["math_rft.merge_evaluations", "--inputs", *map(str, shards),
-                             "--data", str(data), "--output", str(result)])
+        shards, merge = evaluation_shards(evaluation, args.gpus, output)
+        commands.extend(shards)
+        if merge is not None:
+            commands.append(merge)
     if {"rft", "grpo"} <= results.keys():
         comparison = (output / "comparisons" / args.stage / args.model / f"seed_{args.seed}" / "rft_vs_grpo").resolve()
         if not comparison.is_relative_to(output):

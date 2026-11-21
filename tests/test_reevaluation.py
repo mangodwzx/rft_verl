@@ -128,6 +128,41 @@ class ReevaluationTests(unittest.TestCase):
                         self.assertEqual(option(command, "--training-loss-scale-factor"), str(factor))
                 self.assertFalse(output.exists())
 
+    def test_include_base_shards_pinned_model_on_same_alfworld_test_protocol(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source, data, output = self.fixture(Path(temporary))
+            (data / "test.jsonl").write_text("{}\n", encoding="utf-8")
+            for method in ("rft", "grpo"):
+                run = source / "qwen3_1p7b" / method / "pilot/seed_42"
+                for filename in ("run_manifest.json", "training_complete.json"):
+                    path = run / filename
+                    payload = json.loads(path.read_text())
+                    payload.update(benchmark="alfworld", alfworld={"max_steps": 37, "max_action_tokens": 91},
+                                   loss_normalization="fixed", loss_scale_factor=4096)
+                    path.write_text(json.dumps(payload))
+            args = self.arguments(source, data, output, "--split", "test", "--gpus", "0", "6",
+                                  "--profile", "lowmem", "--batch-size", "16", "--env-workers", "8")
+            commands = reevaluate.plan(reevaluate.parser().parse_args([*args, "--include-base"]))
+            evaluations = [c for c in commands if c[0] == "math_rft.evaluate"]
+            base_shards = []
+            expected = {"--benchmark": "alfworld", "--role": "formal", "--data": str(data / "test.jsonl"),
+                        "--max-steps": "37", "--max-action-tokens": "91", "--profile": "lowmem",
+                        "--batch-size": "16", "--env-workers": "8", "--n": "256", "--seed": "20261025",
+                        "--num-shards": "2"}
+            self.assertCountEqual([(option(c, "--method"), option(c, "--shard-index")) for c in evaluations],
+                                  [(method, index) for method in ("base", "rft", "grpo") for index in ("0", "1")])
+            for command in evaluations:
+                self.assertEqual({name: option(command, name) for name in expected}, expected)
+                if option(command, "--method") == "base":
+                    self.assertEqual(option(command, "--model"), "Qwen/Qwen3-1.7B-Base")
+                    self.assertEqual(option(command, "--revision"), "a" * 40)
+                    for name in ("--training-seed", "--training-loss-normalization", "--training-loss-scale-factor"):
+                        self.assertNotIn(name, command)
+                    base_shards.append(option(command, "--output"))
+            merged = output / "baselines/pilot/qwen3_1p7b/test.jsonl"
+            self.assertIn(["math_rft.merge_evaluations", "--inputs", *base_shards, "--data", str(data / "test.jsonl"),
+                           "--output", str(merged)], commands)
+
     def test_mixed_or_unknown_training_objectives_fail_before_any_job(self):
         for other in (None, ("per_response", None), ("fixed", 2048)):
             with self.subTest(other=other), tempfile.TemporaryDirectory() as temporary:
@@ -303,7 +338,8 @@ class ReevaluationTests(unittest.TestCase):
             for extra in (("--n", "128"), ("--seed", "-1"), ("--evaluation-seed", "-1"),
                           ("--batch-size", "0"), ("--max-num-seqs", "-1"),
                           ("--max-num-batched-tokens", "0"), ("--gpu-memory-utilization", "nan"),
-                          ("--gpu-memory-utilization", "1"), ("--methods", "rft", "rft")):
+                          ("--gpu-memory-utilization", "1"), ("--methods", "rft", "rft"),
+                          ("--env-workers", "-1"), ("--env-workers", "8")):
                 with self.subTest(extra=extra), self.assertRaises(ValueError):
                     reevaluate.plan(reevaluate.parser().parse_args(self.arguments(source, data, output, *extra)))
 

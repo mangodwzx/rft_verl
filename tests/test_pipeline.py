@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -33,7 +34,64 @@ class PipelinePlanTests(unittest.TestCase):
             resolve.assert_not_called()
         self.assertFalse(output.exists())
         self.assertFalse(data.exists())
-        return [shlex.split(line)[2:] for line in stream.getvalue().splitlines() if not line.startswith("PLAN ONLY")]
+        commands = [shlex.split(line) for line in stream.getvalue().splitlines() if not line.startswith("PLAN ONLY")]
+        return [command[command.index("-m") + 1:] for command in commands]
+
+    def test_trained_evaluation_shards_leave_baseline_and_training_unchanged(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            common = ("--benchmark", "alfworld", "--profile", "lowmem", "--models", "qwen3_1p7b",
+                      "--seeds", "42", "--eval-env-workers", "4", "--set", "trainer.n_gpus_per_node=2",
+                      "--baseline-resume-from", str(root / "old/dev.jsonl"))
+            original = self.plan(root, *common)
+            adjusted = self.plan(root, *common, "--trained-eval-gpus", "0", "6",
+                                 "--trained-eval-profile", "lowmem", "--trained-eval-batch-size", "16",
+                                 "--trained-eval-env-workers", "8", "--no-trained-eval-enforce-eager")
+        select = lambda commands, module: [command for command in commands if command[0] == module]
+        self.assertEqual(select(original, "math_rft.train"), select(adjusted, "math_rft.train"))
+        evaluations = select(adjusted, "math_rft.evaluate")
+        baseline = next(command for command in evaluations if option(command, "--method") == "base")
+        self.assertEqual(baseline, select(original, "math_rft.evaluate")[0])
+        baseline_args = evaluate.resolve_execution_options(evaluate.parser().parse_args(baseline[1:]))
+        self.assertEqual((baseline_args.batch_size, baseline_args.env_workers), (8, 4))
+        for method in ("rft", "grpo"):
+            shards = [command for command in evaluations if option(command, "--method") == method]
+            self.assertEqual(len(shards), 2)
+            for index, command in enumerate(shards):
+                args = evaluate.resolve_execution_options(evaluate.parser().parse_args(command[1:]))
+                self.assertEqual((args.num_shards, args.shard_index, args.tensor_parallel_size), (2, index, 1))
+                self.assertEqual((args.n, args.seed, args.training_seed), (256, 20261025, 42))
+                self.assertEqual((args.max_steps, args.max_action_tokens, args.max_tokens), (50, 128, 4096))
+                self.assertEqual((args.batch_size, args.env_workers), (16, 8))
+                self.assertFalse(args.enforce_eager)
+                self.assertIsNone(args.resume_from)
+        merges = select(adjusted, "math_rft.merge_evaluations")
+        self.assertEqual(len(merges), 2)
+        analysis = select(adjusted, "math_rft.analyze")[0]
+        self.assertEqual(option(analysis, "--left"), option(merges[0], "--output"))
+        self.assertEqual(option(analysis, "--right"), option(merges[1], "--output"))
+
+    def test_trained_profile_override_does_not_change_baseline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            commands = self.plan(Path(temporary), "--benchmark", "alfworld", "--profile", "lowmem",
+                                 "--models", "qwen3_1p7b", "--seeds", "42", "--trained-eval-profile", "throughput")
+        for command in commands:
+            if command[0] == "math_rft.train" or (command[0] == "math_rft.evaluate" and
+                                                  option(command, "--method") == "base"):
+                self.assertEqual(option(command, "--profile"), "lowmem")
+            elif command[0] == "math_rft.evaluate":
+                self.assertEqual(option(command, "--profile"), "throughput")
+
+    def test_invalid_trained_execution_options_fail_before_launch(self):
+        for extra in (("--trained-eval-gpus", "0", "0"), ("--trained-eval-gpus", "06"),
+                      ("--trained-eval-batch-size", "0"), ("--trained-eval-env-workers", "-1"),
+                      ("--trained-eval-gpu-memory-utilization", "nan"),
+                      ("--trained-eval-max-num-seqs", "0"), ("--trained-eval-max-num-batched-tokens", "-1")):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as temporary, \
+                    redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.plan(Path(temporary), "--benchmark", "alfworld", *extra)
+        with tempfile.TemporaryDirectory() as temporary, redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.plan(Path(temporary), "--trained-eval-env-workers", "8")
 
     def test_pilot_evaluates_all_three_curves_on_dev_at_256(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -274,6 +332,37 @@ class PipelinePlanTests(unittest.TestCase):
 
 
 class PipelineEnvironmentTests(unittest.TestCase):
+    def test_trained_shards_finish_before_merge_and_failure_skips_merge(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command = pipeline.evaluation("checkpoint", root / "data", root / "dev.jsonl", "repo", 256,
+                                          "rft", 20261025, 42, None, "dev", "lowmem", benchmark="alfworld",
+                                          env_workers=8)
+            events = []
+            with patch.object(pipeline, "parallel_evaluations", side_effect=lambda *args: events.append("shards")) as parallel, \
+                    patch.object(pipeline, "invoke", side_effect=lambda *args, **kwargs: events.append("merge")) as invoke, \
+                    redirect_stdout(io.StringIO()):
+                pipeline.invoke_trained_evaluation(command, True, profile="lowmem", gpus=["0", "6"], output_root=root)
+            self.assertEqual(events, ["shards", "merge"])
+            self.assertEqual(parallel.call_args.args[1], ["0", "6"])
+            self.assertEqual(invoke.call_args.args[0][0], "math_rft.merge_evaluations")
+            with patch.object(pipeline, "parallel_evaluations", side_effect=subprocess.CalledProcessError(1, "evaluate")), \
+                    patch.object(pipeline, "invoke") as invoke, redirect_stdout(io.StringIO()), \
+                    self.assertRaises(subprocess.CalledProcessError):
+                pipeline.invoke_trained_evaluation(command, True, profile="lowmem", gpus=["0", "6"], output_root=root)
+            invoke.assert_not_called()
+
+    def test_single_explicit_gpu_uses_launcher_without_shard_or_merge(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command = pipeline.evaluation("checkpoint", root / "data", root / "dev.jsonl", "repo", 256,
+                                          "rft", 20261025, 42, None, "dev")
+            with patch.object(pipeline, "parallel_evaluations") as parallel, \
+                    patch.object(pipeline, "invoke") as invoke, redirect_stdout(io.StringIO()):
+                pipeline.invoke_trained_evaluation(command, True, profile="default", gpus=["6"], output_root=root)
+            parallel.assert_called_once_with([command], ["6"])
+            invoke.assert_not_called()
+
     def test_lowmem_sampler_workaround_is_confined_to_child_environment(self):
         with patch.dict(os.environ, {"VLLM_USE_FLASHINFER_SAMPLER": "1"}), \
                 patch.object(pipeline.subprocess, "run") as launch, redirect_stdout(io.StringIO()):
